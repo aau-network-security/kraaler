@@ -7,19 +7,52 @@ import (
 )
 
 func TestRetrieveLinks(t *testing.T) {
+	domain := "https://test.com"
 	tt := []struct {
 		name string
 		src  string
-		urls int
+		urls []string
 	}{
-		{name: "simple valid", src: "<html><a href=\"https://google.com\">t</a></html>", urls: 1},
-		{name: "empty", src: "<html></html>", urls: 0},
+		{
+			name: "simple valid",
+			src:  `<html><a href="https://google.com">t</a></html>`,
+			urls: []string{
+				"https://google.com",
+			},
+		},
+		{
+			name: "relative valid",
+			src:  `<html><a href="/search">t</a></html>`,
+			urls: []string{
+				domain + "/search",
+			},
+		},
+		{
+			name: "empty",
+			src:  "<html></html>",
+		},
 	}
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
-			if n := len(kraaler.RetrieveLinks(tc.src)); n != tc.urls {
+			found, err := kraaler.RetrieveLinks(domain, tc.src)
+			if err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+
+			if n := len(found); n != len(tc.urls) {
 				t.Fatalf("expected to find %d urls, but found %d", tc.urls, n)
+			}
+
+			expectedUrls := map[string]bool{}
+			for _, link := range tc.urls {
+				expectedUrls[link] = true
+			}
+
+			for _, foundUrl := range found {
+				if ok := expectedUrls[foundUrl.String()]; !ok {
+					t.Fatalf("unexpected url: %s", foundUrl)
+				}
 			}
 		})
 	}

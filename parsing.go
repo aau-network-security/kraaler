@@ -7,10 +7,15 @@ import (
 	"github.com/PuerkitoBio/goquery"
 )
 
-func RetrieveLinks(src string) []*url.URL {
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(src))
+func RetrieveLinks(src, body string) ([]*url.URL, error) {
+	host, err := url.Parse(src)
 	if err != nil {
-		return nil
+		return nil, err
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
 
 	urls := map[string]struct{}{}
@@ -31,8 +36,16 @@ func RetrieveLinks(src string) []*url.URL {
 			continue
 		}
 
+		if link.Host == "" {
+			link.Host = host.Host
+		}
+
+		if link.Scheme == "" {
+			link.Scheme = host.Scheme
+		}
+
 		res = append(res, link)
 	}
 
-	return res
+	return res, nil
 }
