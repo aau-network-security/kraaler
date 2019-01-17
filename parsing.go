@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/mvdan/xurls"
 )
 
 func RetrieveLinks(src, body string) ([]*url.URL, error) {
@@ -29,6 +30,10 @@ func RetrieveLinks(src, body string) ([]*url.URL, error) {
 		urls[href] = struct{}{}
 	})
 
+	for _, m := range xurls.Relaxed().FindAllString(doc.Text(), -1) {
+		urls[m] = struct{}{}
+	}
+
 	var res []*url.URL
 	for u, _ := range urls {
 		link, err := url.Parse(u)
@@ -37,10 +42,12 @@ func RetrieveLinks(src, body string) ([]*url.URL, error) {
 		}
 
 		if link.Host == "" {
-			link.Host = host.Host
-		}
+			// cannot replace source with anything meaningful
+			if host.Host == "" {
+				continue
+			}
 
-		if link.Scheme == "" {
+			link.Host = host.Host
 			link.Scheme = host.Scheme
 		}
 

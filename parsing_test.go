@@ -28,6 +28,20 @@ func TestRetrieveLinks(t *testing.T) {
 			},
 		},
 		{
+			name: "text valid",
+			src:  `<html><div>https://google.com</div></html>`,
+			urls: []string{
+				"https://google.com",
+			},
+		},
+		{
+			name: "overlap valid",
+			src:  `<html><a href="https://google.com">https://google.com</a></html>`,
+			urls: []string{
+				"https://google.com",
+			},
+		},
+		{
 			name: "empty",
 			src:  "<html></html>",
 		},
@@ -41,7 +55,7 @@ func TestRetrieveLinks(t *testing.T) {
 			}
 
 			if n := len(found); n != len(tc.urls) {
-				t.Fatalf("expected to find %d urls, but found %d", tc.urls, n)
+				t.Fatalf("expected to find %d url(s), but found %d", len(tc.urls), n)
 			}
 
 			expectedUrls := map[string]bool{}
