@@ -30,7 +30,7 @@ func RetrieveLinks(src, body string) ([]*url.URL, error) {
 		urls[href] = struct{}{}
 	})
 
-	for _, m := range xurls.Relaxed().FindAllString(doc.Text(), -1) {
+	for _, m := range xurls.Relaxed.FindAllString(doc.Text(), -1) {
 		urls[m] = struct{}{}
 	}
 
