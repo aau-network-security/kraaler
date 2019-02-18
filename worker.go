@@ -86,10 +86,10 @@ func NewWorker(conf WorkerConfig) (*Worker, error) {
 		}
 		w.container = c
 
-		WaitForPort(w.port)
-
 		endpoint = fmt.Sprintf("localhost:%d", w.port)
 	}
+
+	WaitForInstance(endpoint, 2*time.Minute)
 
 	rdb, err := godet.Connect(endpoint, false)
 	if err != nil {
@@ -482,18 +482,25 @@ func PullImage(c *docker.Client, img string) error {
 	}, docker.AuthConfiguration{})
 }
 
-func WaitForPort(port uint) {
-	endpoint := fmt.Sprintf("localhost:%d", port)
+func WaitForInstance(endpoint string, max time.Duration) {
+	t := time.NewTicker(max)
+	defer t.Stop()
+
 	for {
 		conn, err := godet.Connect(endpoint, false)
-		if conn != nil {
-			conn.Close()
-			break
+		select {
+		case <-t.C:
+			return
+		default:
+			if conn != nil {
+				conn.Close()
+				return
+			}
+
+			fmt.Println(endpoint, ": ", err)
+			time.Sleep(time.Second)
 		}
 
-		fmt.Println(endpoint, ": ", err)
-
-		time.Sleep(time.Second)
 	}
 }
 
