@@ -4,6 +4,9 @@ sudo: true
 
 language: go
 
+services:
+  - docker
+
 cache:
   directories:
     - $HOME/.cache/go-build
@@ -24,6 +27,9 @@ git:
 
 # Skip the install step. Don't `go get` dependencies. Only build with the code
 # in vendor/
+before_install:
+- docker pull chromedp/headless-shell
+
 install: true
 
 # Don't email me the results of the test runs.

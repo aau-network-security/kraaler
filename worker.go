@@ -477,7 +477,7 @@ func PullImage(c *docker.Client, img string) error {
 }
 
 func WaitForPort(port uint) {
-	endpoint := fmt.Sprintf("127.0.0.1:%d", port)
+	endpoint := fmt.Sprintf("localhost:%d", port)
 	for {
 		conn, _ := godet.Connect(endpoint, false)
 		if conn != nil {
