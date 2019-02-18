@@ -487,7 +487,7 @@ func WaitForInstance(endpoint string, max time.Duration) {
 	defer t.Stop()
 
 	for {
-		conn, err := godet.Connect(endpoint, false)
+		conn, _ := godet.Connect(endpoint, false)
 		select {
 		case <-t.C:
 			return
@@ -497,7 +497,6 @@ func WaitForInstance(endpoint string, max time.Duration) {
 				return
 			}
 
-			fmt.Println(endpoint, ": ", err)
 			time.Sleep(time.Second)
 		}
 
