@@ -1,6 +1,7 @@
 package kraaler_test
 
 import (
+	"flag"
 	"fmt"
 	"net"
 	"net/http"
@@ -12,6 +13,13 @@ import (
 	"github.com/aau-network-security/kraaler"
 	docker "github.com/fsouza/go-dockerclient"
 )
+
+var travis bool
+
+func init() {
+	flag.BoolVar(&travis, "travis", false, "is the tester travis")
+	flag.Parse()
+}
 
 func dockerInterfaceIP() (string, error) {
 	ifaces, err := net.Interfaces()
@@ -71,10 +79,16 @@ func responseFromServerWithHandler(handler http.Handler) (*kraaler.CrawlSession,
 		return nil, err
 	}
 
+	var instance string
+	if travis {
+		instance = "localhost:9222"
+	}
+
 	w, err := kraaler.NewWorker(kraaler.WorkerConfig{
 		Queue:        q,
 		Responses:    resps,
 		DockerClient: dclient,
+		UseInstance:  instance,
 	})
 	if err != nil {
 		return nil, err

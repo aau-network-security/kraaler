@@ -1,7 +1,6 @@
 package kraaler
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"log"
@@ -50,6 +49,7 @@ type WorkerConfig struct {
 	Queue        <-chan CrawlRequest
 	Responses    chan<- CrawlSession
 	DockerClient *docker.Client
+	UseInstance  string
 	Resolution   *Resolution
 }
 
@@ -78,32 +78,20 @@ func NewWorker(conf WorkerConfig) (*Worker, error) {
 		conf: conf,
 	}
 
-	c, err := w.createContainer()
-	if err != nil {
-		return nil, err
-	}
-	w.container = c
-
-	go func() {
-		for {
-			var b bytes.Buffer
-			w.conf.DockerClient.Logs(docker.LogsOptions{
-				Container:    c.ID,
-				OutputStream: &b,
-				Stdout:       true,
-				Stderr:       true,
-				RawTerminal:  true,
-			})
-
-			fmt.Println(string(b.Bytes()))
-
-			time.Sleep(time.Second)
+	endpoint := conf.UseInstance
+	if conf.UseInstance == "" {
+		c, err := w.createContainer()
+		if err != nil {
+			return nil, err
 		}
-	}()
+		w.container = c
 
-	WaitForPort(w.port)
+		WaitForPort(w.port)
 
-	rdb, err := godet.Connect(fmt.Sprintf("localhost:%d", w.port), false)
+		endpoint = fmt.Sprintf("localhost:%d", w.port)
+	}
+
+	rdb, err := godet.Connect(endpoint, false)
 	if err != nil {
 		return nil, err
 	}

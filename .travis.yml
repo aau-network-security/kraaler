@@ -22,20 +22,14 @@ go:
 git:
   depth: 1
 
-# Skip the install step. Don't `go get` dependencies. Only build with the code
-# in vendor/
 before_install:
-- ifconfig
+  - google-chrome-stable --headless --disable-gpu --remote-debugging-port=9222 http://localhost &
 
 install: true
 
 # Don't email me the results of the test runs.
 notifications:
   email: false
-
-addons:
-  hosts:
-    - localhost
 
 # Anything in before_script that returns a nonzero exit code will flunk the
 # build and immediately stop. It's sorta like having set -e enabled in bash.
@@ -48,4 +42,4 @@ addons:
 # .golangci.yml file at the top level of your repo.
 script:
   # - golangci-lint run       # run a bunch of code checkers/linters in parallel
-  - go test -v -timeout 1m
+  - go test -v -timeout 1m -travis
