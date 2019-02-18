@@ -143,7 +143,7 @@ func (w *Worker) createContainer() (*docker.Container, error) {
 		Name: fmt.Sprintf("kraaler-worker-%s", w.id),
 		Config: &docker.Config{
 			Image: img,
-			Cmd:   []string{fmt.Sprintf("--window-size=%s", w.conf.Resolution), "--no-sandbox"},
+			Cmd:   []string{fmt.Sprintf("--window-size=%s", w.conf.Resolution), "--no-sandbox", "--disable-gpu"},
 		},
 		HostConfig: &docker.HostConfig{
 			MemorySwap:       0,
