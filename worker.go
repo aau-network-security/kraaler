@@ -1,6 +1,7 @@
 package kraaler
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"log"
@@ -82,6 +83,23 @@ func NewWorker(conf WorkerConfig) (*Worker, error) {
 		return nil, err
 	}
 	w.container = c
+
+	go func() {
+		for {
+			var b bytes.Buffer
+			w.conf.DockerClient.Logs(docker.LogsOptions{
+				Container:    c.ID,
+				OutputStream: &b,
+				Stdout:       true,
+				Stderr:       true,
+				RawTerminal:  true,
+			})
+
+			fmt.Println(string(b.Bytes()))
+
+			time.Sleep(time.Second)
+		}
+	}()
 
 	WaitForPort(w.port)
 
