@@ -3,8 +3,10 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"net/http"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/aau-network-security/kraaler"
 )
@@ -26,7 +28,7 @@ func TestGetHostID(t *testing.T) {
 		{name: "subdomains", ip: "8.8.8.8", url: "https://mail.google.com/", row: row{"mail.google.com", "com", "8.8.8.8"}},
 	}
 
-	s, err := NewStore("get_host_id.db")
+	s, err := NewStore("get_host_id.db", "dummy-store")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +42,7 @@ func TestGetHostID(t *testing.T) {
 					t.Fatalf("unexpected error when creating transaction: %s", err)
 				}
 
-				id, err := txStore{tx}.getHostID(kraaler.BrowserAction{
+				id, err := txStore{tx: tx}.getHostId(kraaler.BrowserAction{
 					HostIP: &tc.ip,
 					Request: kraaler.BrowserRequest{
 						URL: tc.url,
@@ -109,7 +111,7 @@ func TestGetSchemeId(t *testing.T) {
 		{name: "basic", protocol: "HTTP 2", url: "https://google.com/", row: row{"https", "HTTP 2"}},
 	}
 
-	s, err := NewStore("get_scheme_id.db")
+	s, err := NewStore("get_scheme_id.db", "dummy-store")
 	if err != nil {
 		t.Fatalf("unable to open database: %s", err)
 	}
@@ -123,7 +125,7 @@ func TestGetSchemeId(t *testing.T) {
 					t.Fatalf("unexpected error when creating transaction: %s", err)
 				}
 
-				id, err := txStore{tx}.getSchemeId(kraaler.BrowserAction{
+				id, err := txStore{tx: tx}.getSchemeId(kraaler.BrowserAction{
 					Protocol: &tc.protocol,
 					Request: kraaler.BrowserRequest{
 						URL: tc.url,
@@ -146,9 +148,8 @@ func TestGetSchemeId(t *testing.T) {
 			id := getId()
 
 			var dummyId int64
-			err = s.db.QueryRow("select id from dim_schemes where kind = ? AND protocol = ?",
+			err = s.db.QueryRow("select id from dim_schemes where scheme = ?",
 				tc.row.kind,
-				tc.row.protocol,
 			).Scan(&dummyId)
 			if err != nil && err != sql.ErrNoRows {
 				t.Fatalf("error fetching: %s", err)
@@ -176,7 +177,7 @@ func TestGetInitiatorId(t *testing.T) {
 		{name: "basic", initiator: "parser", row: row{"parser"}},
 	}
 
-	s, err := NewStore("get_initiator_id.db")
+	s, err := NewStore("get_initiator_id.db", "dummy-store")
 	if err != nil {
 		t.Fatalf("unable to open database: %s", err)
 	}
@@ -190,7 +191,7 @@ func TestGetInitiatorId(t *testing.T) {
 					t.Fatalf("unexpected error when creating transaction: %s", err)
 				}
 
-				id, err := txStore{tx}.getInitiatorId(kraaler.BrowserAction{
+				id, err := txStore{tx: tx}.getInitiatorId(kraaler.BrowserAction{
 					Initiator: tc.initiator,
 				})
 
@@ -239,7 +240,7 @@ func TestGetErrorId(t *testing.T) {
 		{name: "basic", error: "error is bad", row: row{"error is bad"}},
 	}
 
-	s, err := NewStore("get_error_id.db")
+	s, err := NewStore("get_error_id.db", "dummy-store")
 	if err != nil {
 		t.Fatalf("unable to open database: %s", err)
 	}
@@ -253,7 +254,7 @@ func TestGetErrorId(t *testing.T) {
 					t.Fatalf("unexpected error when creating transaction: %s", err)
 				}
 
-				id, err := txStore{tx}.getErrorId(kraaler.BrowserAction{
+				id, err := txStore{tx: tx}.getErrorId(kraaler.BrowserAction{
 					ResponseError: &tc.error,
 				})
 
@@ -290,7 +291,7 @@ func TestGetErrorId(t *testing.T) {
 }
 
 func TestGetKeyValueId(t *testing.T) {
-	s, err := NewStore("get_keyv_id.db")
+	s, err := NewStore("get_keyv_id.db", "dummy-store")
 	if err != nil {
 		t.Fatalf("unable to open database: %s", err)
 	}
@@ -302,7 +303,7 @@ func TestGetKeyValueId(t *testing.T) {
 			t.Fatalf("unexpected error when creating transaction: %s", err)
 		}
 
-		id, err := txStore{tx}.getKeyvalueId("keytest", "valuetest")
+		id, err := txStore{tx: tx}.getKeyvalueId("keytest", "valuetest")
 
 		tx.Commit()
 
@@ -342,4 +343,58 @@ func TestGetKeyValueId(t *testing.T) {
 		t.Fatalf("expected id to be reused")
 	}
 
+}
+
+func TestStoreSave(t *testing.T) {
+	s, err := NewStore("save_test.db", "dummy-store")
+	if err != nil {
+		t.Fatalf("unable to open database: %s", err)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatalf("unexpected error when creating transaction: %s", err)
+	}
+
+	proto := "HTTP 1.1"
+	hostip := "1.1.1.1"
+	action := kraaler.BrowserAction{
+		Initiator: "parser",
+		Protocol:  &proto,
+		Request: kraaler.BrowserRequest{
+			URL:    "https://google.com/",
+			Method: "GET",
+			Headers: map[string]string{
+				"Dummy-Header": "Testing",
+			},
+		},
+		Response: &kraaler.BrowserResponse{
+			StatusCode: http.StatusOK,
+			Headers: map[string]string{
+				"Dummy-Reply": "Testing2",
+			},
+			MimeType:           "text/html",
+			Body:               []byte("meow"),
+			BodyChecksumSha256: "asbcsast",
+		},
+		HostIP: &hostip,
+		SecurityDetails: &kraaler.BrowserSecurityDetails{
+			Protocol:    "TLS 1.2",
+			KeyExchange: "RSA",
+			Cipher:      "No idea",
+			SubjectName: "google.com",
+			SanList:     []string{"aaa", "bbb", "ccc"},
+			Issuer:      "Google",
+			ValidFrom:   time.Now(),
+			ValidTo:     time.Now().Add(24 * time.Hour),
+		},
+		Console: []string{"test1", "test2"},
+	}
+
+	err = s.Save(action)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx.Commit()
 }

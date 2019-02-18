@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	docker "github.com/fsouza/go-dockerclient"
@@ -14,14 +15,16 @@ import (
 	"github.com/raff/godet"
 )
 
-var DefaultClient *docker.Client
+const (
+	CHROME_REQ_WILL_BE_SENT = "Network.requestWillBeSent"
+	CHROME_RESP_RECEIVED    = "Network.responseReceived"
+	CHROME_LOADING_FAILED   = "Network.loadingFailed"
+	CUSTOM_GOT_BODY         = "Custom.body"
+)
 
-func init() {
-	var err error
-	DefaultClient, err = docker.NewClient("unix:///var/run/docker.sock")
-	if err != nil {
-		log.Fatal(err)
-	}
+var DefaultResolution = &Resolution{
+	Width:  1366,
+	Height: 768,
 }
 
 type NoParamErr struct{ param string }
@@ -33,19 +36,45 @@ type NotOfTypeErr struct{ kind string }
 func (note *NotOfTypeErr) Error() string { return fmt.Sprintf("value is not of type: %s", note.kind) }
 
 type Worker struct {
-	ID   string
-	Port uint
-
+	id        string
+	port      uint
 	container *docker.Container
 	rdb       *godet.RemoteDebugger
+	kill      chan struct{}
 
-	kill chan struct{}
+	conf WorkerConfig
 }
 
-func NewWorker(queue <-chan *FetchRequest, results chan<- FetchResponse) (*Worker, error) {
+type WorkerConfig struct {
+	Queue        <-chan CrawlRequest
+	Responses    chan<- CrawlSession
+	DockerClient *docker.Client
+	Resolution   *Resolution
+}
+
+func NewWorker(conf WorkerConfig) (*Worker, error) {
+	werr := func(err error) (*Worker, error) { return nil, err }
+
+	if conf.Queue == nil {
+		return werr(fmt.Errorf("queue chan is nil"))
+	}
+
+	if conf.Responses == nil {
+		return werr(fmt.Errorf("response chan is nil"))
+	}
+
+	if conf.DockerClient == nil {
+		return werr(fmt.Errorf("docker client cannot be nil"))
+	}
+
+	if conf.Resolution == nil {
+		conf.Resolution = DefaultResolution
+	}
+
 	id := uuid.New().String()[0:8]
 	w := &Worker{
-		ID: id,
+		id:   id,
+		conf: conf,
 	}
 
 	c, err := w.createContainer()
@@ -54,20 +83,23 @@ func NewWorker(queue <-chan *FetchRequest, results chan<- FetchResponse) (*Worke
 	}
 	w.container = c
 
-	WaitForPort(w.Port)
+	WaitForPort(w.port)
 
-	rdb, err := godet.Connect(fmt.Sprintf("localhost:%d", w.Port), false)
+	rdb, err := godet.Connect(fmt.Sprintf("localhost:%d", w.port), false)
 	if err != nil {
+		return nil, err
+	}
+	if err := rdb.SetCacheDisabled(true); err != nil {
 		return nil, err
 	}
 	w.rdb = rdb
 
-	go w.listen(queue, results)
+	go w.listen(conf.Queue, conf.Responses)
 
 	return w, nil
 }
 
-func (w *Worker) listen(queue <-chan *FetchRequest, results chan<- FetchResponse) {
+func (w *Worker) listen(queue <-chan CrawlRequest, results chan<- CrawlSession) {
 	w.kill = make(chan struct{})
 
 	for {
@@ -76,47 +108,215 @@ func (w *Worker) listen(queue <-chan *FetchRequest, results chan<- FetchResponse
 			return
 
 		case req := <-queue:
-			results <- w.fetch(req)
+			resp := w.fetch(req)
+			results <- resp
 		}
 	}
 }
 
 func (w *Worker) createContainer() (*docker.Container, error) {
-	if w.Port == 0 {
+	if w.port == 0 {
 		port := GetAvailablePort()
-		w.Port = port
+		w.port = port
 	}
 
+	img := "chromedp/headless-shell"
 	opts := docker.CreateContainerOptions{
-		Name: fmt.Sprintf("kraaler-worker-%s", w.ID),
+		Name: fmt.Sprintf("kraaler-worker-%s", w.id),
 		Config: &docker.Config{
-			Image: "justinribeiro/chrome-headless",
+			Image: img,
+			Cmd:   []string{fmt.Sprintf("--window-size=%s", w.conf.Resolution)},
 		},
 		HostConfig: &docker.HostConfig{
 			MemorySwap:       0,
 			MemorySwappiness: 0,
 			Memory:           756 * 1024 * 1024,
-			CapAdd:           []string{"SYS_ADMIN"},
 			PortBindings: map[docker.Port][]docker.PortBinding{
 				docker.Port("9222/tcp"): {{
 					HostIP:   "127.0.0.1",
-					HostPort: fmt.Sprintf("%d", w.Port),
+					HostPort: fmt.Sprintf("%d", w.port),
 				}},
 			},
 		},
 	}
 
-	c, err := DefaultClient.CreateContainer(opts)
+	c, err := w.conf.DockerClient.CreateContainer(opts)
 	if err != nil {
-		return nil, err
+		if err.Error() != "no such image" {
+			return nil, err
+		}
+
+		if err := PullImage(w.conf.DockerClient, img); err != nil {
+			return nil, err
+		}
+
+		c, err = w.conf.DockerClient.CreateContainer(opts)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	if err := DefaultClient.StartContainer(c.ID, nil); err != nil {
-		DefaultClient.RemoveContainer(docker.RemoveContainerOptions{ID: c.ID})
+	if err := w.conf.DockerClient.StartContainer(c.ID, nil); err != nil {
+		w.conf.DockerClient.RemoveContainer(docker.RemoveContainerOptions{ID: c.ID})
 		return nil, err
 	}
 
 	return c, nil
+}
+
+type ChromeEventParam struct {
+	event  string
+	params map[string]interface{}
+}
+
+func (w *Worker) fetch(req CrawlRequest) CrawlSession {
+	stop := make(chan time.Time)
+
+	w.rdb.CallbackEvent("Page.frameStoppedLoading", func(params godet.Params) {
+		stop <- time.Now()
+	})
+
+	var console []string
+	w.rdb.CallbackEvent("Runtime.consoleAPICalled",
+		godet.ConsoleAPICallback(func(items []interface{}) {
+			if len(items) < 2 {
+				return
+			}
+
+			kind, ok := items[0].(string)
+			if !ok {
+				return
+			}
+
+			if kind != "console.log" {
+				return
+			}
+
+			var logMsg string
+			for i := 1; i < len(items); i++ {
+				logMsg += fmt.Sprintf(" %v", items[i])
+			}
+
+			console = append(console, logMsg[1:])
+		}))
+
+	raw := map[string][]ChromeEventParam{}
+	var m sync.Mutex
+
+	for _, e := range []string{
+		CHROME_REQ_WILL_BE_SENT,
+		CHROME_RESP_RECEIVED,
+		CHROME_LOADING_FAILED,
+	} {
+		func(e string) {
+			w.rdb.CallbackEvent(e, func(params godet.Params) {
+				id, ok := params["requestId"].(string)
+				if !ok {
+					return
+				}
+
+				m.Lock()
+				eps := raw[id]
+				raw[id] = append(eps, ChromeEventParam{e, params})
+				m.Unlock()
+			})
+		}(e)
+	}
+
+	tab, err := w.rdb.NewTab("about:blank")
+	if err != nil {
+		return CrawlSession{Error: err}
+	}
+
+	w.rdb.NetworkEvents(true)
+	w.rdb.RuntimeEvents(true)
+	w.rdb.PageEvents(true)
+
+	clear := func() {
+		w.rdb.ClearBrowserCookies()
+		w.rdb.CloseTab(tab)
+	}
+	defer clear()
+
+	if err := w.rdb.ActivateTab(tab); err != nil {
+		return CrawlSession{Error: err}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	starttime := time.Now()
+	if _, err := w.rdb.Navigate(req.Url.String()); err != nil {
+		return CrawlSession{Error: err}
+	}
+	loadedtime := <-stop
+
+	screen := make(chan *BrowserScreenshot, 1)
+
+	var wg sync.WaitGroup
+	capture := func(d time.Duration) {
+		time.Sleep(3 * time.Second)
+		ss, err := w.CaptureScreenshot()
+		if err != nil {
+			log.Printf("unable to capture screenshot: %s", err)
+		}
+
+		screen <- ss
+		wg.Done()
+	}
+
+	for _, timing := range req.Screenshots {
+		wg.Add(1)
+		capture(timing)
+	}
+
+	for id, eps := range raw {
+		body, err := w.rdb.GetResponseBody(id)
+		if err != nil {
+			fmt.Println("body error: ", err)
+			continue
+		}
+
+		params := map[string]interface{}{
+			"body":   body,
+			"sha256": fmt.Sprintf("%x", sha256.Sum256(body)),
+		}
+
+		raw[id] = append(eps, ChromeEventParam{
+			event:  CUSTOM_GOT_BODY,
+			params: params,
+		})
+	}
+
+	wg.Wait()
+	var capturedScreenshots []*BrowserScreenshot
+	for i := 0; i < len(req.Screenshots); i++ {
+		capturedScreenshots = append(capturedScreenshots, <-screen)
+	}
+
+	terminateTime := time.Now()
+
+	return CrawlSession{
+		Resolution:     w.conf.Resolution.String(),
+		Actions:        ActionsFromEvents(raw),
+		Console:        console,
+		Screenshots:    capturedScreenshots,
+		StartTime:      starttime,
+		LoadedTime:     loadedtime,
+		TerminatedTime: terminateTime,
+	}
+}
+
+func (w *Worker) CaptureScreenshot() (*BrowserScreenshot, error) {
+	taken := time.Now()
+	bytes, err := w.rdb.CaptureScreenshot("png", 0, true)
+	if err != nil {
+		return nil, err
+	}
+
+	return &BrowserScreenshot{
+		Screenshot: bytes,
+		Taken:      taken,
+	}, nil
 }
 
 func (w *Worker) Close() {
@@ -127,11 +327,94 @@ func (w *Worker) Close() {
 	}
 
 	if w.container != nil {
-		DefaultClient.RemoveContainer(docker.RemoveContainerOptions{
+		w.conf.DockerClient.RemoveContainer(docker.RemoveContainerOptions{
 			ID:    w.container.ID,
 			Force: true,
 		})
 	}
+}
+
+func ActionsFromEvents(logs map[string][]ChromeEventParam) []*CrawlAction {
+	requestIsSent := func(params map[string]interface{}, last *CrawlAction) (*CrawlAction, error) {
+		_, performedRedirect := params["redirectResponse"].(map[string]interface{})
+		if performedRedirect && last != nil {
+			if err := last.ReadResponse(params, "redirectResponse"); err != nil {
+				return nil, err
+			}
+		}
+
+		_, ok := params["request"].(map[string]interface{})
+		if !ok {
+			return nil, nil
+		}
+
+		a, err := NewCrawlActionFromParams(params)
+		if err != nil {
+			return nil, err
+		}
+
+		switch {
+		case last == nil:
+			a.Initiator = "user"
+		case performedRedirect:
+			a.Initiator = "redirect"
+		default:
+		}
+
+		return a, nil
+	}
+
+	var sessionActions []*CrawlAction
+	for _, eps := range logs {
+		var actions []*CrawlAction
+		var last *CrawlAction
+		for _, ep := range eps {
+			switch ep.event {
+			case CHROME_REQ_WILL_BE_SENT:
+				a, err := requestIsSent(ep.params, last)
+				if err != nil {
+					log.Printf("error handling \"%s\": %s\n", CHROME_REQ_WILL_BE_SENT, err)
+				}
+
+				if a != nil {
+					if last != nil {
+						a.Parent = last
+					}
+
+					actions = append(actions, a)
+					last = a
+				}
+
+			case CHROME_RESP_RECEIVED:
+				if last == nil {
+					continue
+				}
+
+				err := last.ReadResponse(ep.params, "response")
+				if err != nil {
+					log.Printf("error handling \"%s\": %s\n", CHROME_RESP_RECEIVED, err)
+				}
+
+			case CHROME_LOADING_FAILED:
+				err := last.ReadError(ep.params)
+				if err != nil {
+					log.Printf("error handling \"%s\": %s\n", CHROME_LOADING_FAILED, err)
+				}
+
+			case CUSTOM_GOT_BODY:
+				if last == nil {
+					continue
+				}
+
+				last.Response.Body, _ = ep.params["body"].([]byte)
+				last.Response.BodyChecksumSha256, _ = ep.params["sha256"].(string)
+			}
+		}
+
+		sessionActions = append(sessionActions, actions...)
+	}
+
+	return sessionActions
 }
 
 func ReadStringFromParams(key string, params map[string]interface{}) (string, error) {
@@ -176,358 +459,6 @@ func GetParamsFromParams(key string, params map[string]interface{}) (map[string]
 	return vMap, nil
 }
 
-type BrowserAction struct {
-	ID         string
-	Parent     string
-	Initiator  string
-	Protocol   *string
-	CPUProfile []float64
-
-	Request       BrowserRequest
-	Response      *BrowserResponse
-	HostIP        *string
-	ResponseError *string
-
-	Console []string
-	Timings BrowserTimes
-}
-
-func (ba *BrowserAction) Read(event string, params godet.Params) error {
-	switch event {
-	case "Network.requestWillBeSent":
-		return ba.ReadRequest(params)
-
-	case "Network.responseReceived":
-		return ba.ReadResponse(params)
-
-	case "Network.loadingFailed":
-		return ba.ReadError(params)
-	}
-
-	return fmt.Errorf("unknown event")
-}
-
-func (ba *BrowserAction) ReadRequest(gparams godet.Params) error {
-	params := map[string]interface{}(gparams)
-	var err error
-
-	ba.ID, err = ReadStringFromParams("requestId", params)
-	if err != nil {
-		return err
-	}
-
-	ba.Parent, err = ReadStringFromParams("loaderId", params)
-	if err != nil {
-		return err
-	}
-
-	ba.Timings.StartTime, err = ReadFloatFromParams("timestamp", params)
-	if err != nil {
-		return err
-	}
-
-	initz, err := GetParamsFromParams("initiator", params)
-	if err != nil {
-		return err
-	}
-
-	ba.Initiator, err = ReadStringFromParams("type", initz)
-	if err != nil {
-		return err
-	}
-
-	reqz, err := GetParamsFromParams("request", params)
-	if err != nil {
-		return err
-	}
-
-	ba.Request.URL, err = ReadStringFromParams("url", reqz)
-	if err != nil {
-		return err
-	}
-
-	if fragment, err := ReadStringFromParams("urlFragment", reqz); err == nil {
-		ba.Request.URL += fragment
-	}
-
-	ba.Request.Method, err = ReadStringFromParams("method", reqz)
-	if err != nil {
-		return err
-	}
-
-	if data, err := ReadStringFromParams("postData", reqz); err == nil {
-		ba.Request.PostData = &data
-	}
-
-	headerz, err := GetParamsFromParams("headers", reqz)
-	if err != nil {
-		return err
-	}
-	ba.Request.Headers = map[string]string{}
-	for k, v := range headerz {
-		vStr, _ := v.(string)
-		ba.Request.Headers[k] = vStr
-	}
-
-	return nil
-}
-
-func (ba *BrowserAction) ReadResponse(params map[string]interface{}) error {
-	var err error
-	ba.Timings.EndTime, err = ReadFloatFromParams("timestamp", params)
-	if err != nil {
-		return err
-	}
-
-	var resp BrowserResponse
-	if err := resp.Read(params); err != nil {
-		return err
-	}
-
-	ba.Response = &resp
-
-	respz, err := GetParamsFromParams("response", params)
-	if err != nil {
-		return err
-	}
-
-	if ip, err := ReadStringFromParams("remoteIPAddress", respz); err == nil {
-		ba.HostIP = &ip
-	}
-
-	protocol, err := ReadStringFromParams("protocol", respz)
-	if err != nil {
-		return err
-	}
-	ba.Protocol = &protocol
-
-	if timing, err := GetParamsFromParams("timing", respz); err == nil {
-		connStart, err := ReadFloatFromParams("connectStart", timing)
-		if err != nil {
-			return err
-		}
-		ba.Timings.ConnectStartTime = &connStart
-
-		connEnd, err := ReadFloatFromParams("connectEnd", timing)
-		if err != nil {
-			return err
-		}
-		ba.Timings.ConnectEndTime = &connEnd
-
-		sendStart, err := ReadFloatFromParams("sendStart", timing)
-		if err != nil {
-			return err
-		}
-		ba.Timings.SendStartTime = &sendStart
-
-		sendEnd, err := ReadFloatFromParams("sendEnd", timing)
-		if err != nil {
-			return err
-		}
-		ba.Timings.SendEndTime = &sendEnd
-
-		pushStart, err := ReadFloatFromParams("pushStart", timing)
-		if err != nil {
-			return err
-		}
-		ba.Timings.PushStartTime = &pushStart
-
-		pushEnd, err := ReadFloatFromParams("pushEnd", timing)
-		if err != nil {
-			return err
-		}
-		ba.Timings.PushEndTime = &pushEnd
-	}
-
-	return nil
-}
-
-func (ba *BrowserAction) ReadError(params godet.Params) error {
-	var err error
-	ba.Timings.EndTime, err = ReadFloatFromParams("timestamp", params)
-	if err != nil {
-		return err
-	}
-
-	errMsg, err := ReadStringFromParams("errorText", params)
-	if err != nil {
-		return err
-	}
-
-	ba.ResponseError = &errMsg
-
-	return nil
-}
-
-type BrowserRequest struct {
-	URL      string
-	Method   string
-	Headers  map[string]string
-	PostData *string
-}
-
-type BrowserResponse struct {
-	StatusCode         int
-	Headers            map[string]string
-	MimeType           string
-	Body               []byte
-	BodyChecksumSha256 string
-}
-
-func (br *BrowserResponse) Read(params map[string]interface{}) error {
-	rawResp, ok := params["response"].(map[string]interface{})
-	if !ok {
-		return &NoParamErr{"response"}
-	}
-
-	br.MimeType, ok = rawResp["mimeType"].(string)
-	if !ok {
-		return &NoParamErr{"mimeType"}
-	}
-
-	rawStatus, ok := rawResp["status"].(float64)
-	if !ok {
-		return &NoParamErr{"status"}
-	}
-	br.StatusCode = int(rawStatus)
-
-	rawHeaders, ok := rawResp["headers"].(map[string]interface{})
-	if !ok {
-		return &NoParamErr{"headers"}
-	}
-
-	br.Headers = map[string]string{}
-	for k, v := range rawHeaders {
-		vStr, _ := v.(string)
-
-		br.Headers[k] = vStr
-	}
-
-	return nil
-}
-
-type BrowserTimes struct {
-	StartTime        float64
-	EndTime          float64
-	ConnectStartTime *float64
-	ConnectEndTime   *float64
-	SendStartTime    *float64
-	SendEndTime      *float64
-	PushStartTime    *float64
-	PushEndTime      *float64
-}
-
-func (w *Worker) fetch(req *FetchRequest) FetchResponse {
-	stop := make(chan time.Time)
-
-	w.rdb.CallbackEvent("Page.frameStoppedLoading", func(params godet.Params) {
-		stop <- time.Now()
-	})
-
-	var logs []string
-	w.rdb.CallbackEvent("Runtime.consoleAPICalled",
-		godet.ConsoleAPICallback(func(items []interface{}) {
-			fmt.Println(items)
-			if len(items) < 2 {
-				return
-			}
-
-			kind, ok := items[0].(string)
-			if !ok {
-				return
-			}
-
-			if kind != "console.log" {
-				return
-			}
-
-			var logMsg string
-			for i := 1; i < len(items); i++ {
-				logMsg += fmt.Sprintf(" %v", items[i])
-			}
-
-			logs = append(logs, logMsg[1:])
-		}))
-
-	requests := map[string]BrowserAction{}
-	for _, e := range []string{
-		"Network.requestWillBeSent",
-		"Network.responseReceived",
-	} {
-		func(e string) {
-			w.rdb.CallbackEvent(e, func(params godet.Params) {
-				id, ok := params["requestId"].(string)
-				if !ok {
-					return
-				}
-
-				ba := requests[id]
-				if err := ba.Read(e, params); err != nil {
-					log.Println("reading error:", err)
-				}
-				requests[id] = ba
-			})
-		}(e)
-	}
-
-	tab, err := w.rdb.NewTab("about:blank")
-	if err != nil {
-		return FetchResponse{Error: err}
-	}
-
-	w.rdb.NetworkEvents(true)
-	w.rdb.RuntimeEvents(true)
-	w.rdb.PageEvents(true)
-
-	clear := func() {
-		w.rdb.CloseTab(tab)
-		w.rdb.ClearBrowserCache()
-		w.rdb.ClearBrowserCookies()
-	}
-	defer clear()
-
-	if err := w.rdb.ActivateTab(tab); err != nil {
-		return FetchResponse{Error: err}
-	}
-
-	time.Sleep(time.Second)
-
-	start := time.Now()
-	if _, err := w.rdb.Navigate(req.Url.String()); err != nil {
-		return FetchResponse{Error: err}
-	}
-
-	t := <-stop
-
-	time.Sleep(time.Second)
-
-	fmt.Println(logs)
-	fmt.Println(t.Sub(start))
-
-	for _, r := range requests {
-		if r.ResponseError != nil {
-			continue
-		}
-
-		body, err := w.rdb.GetResponseBody(r.ID)
-		if err != nil {
-			fmt.Println("body error: ", err)
-			continue
-		}
-
-		fmt.Println(r)
-
-		r.Response.Body = body
-		r.Response.BodyChecksumSha256 = fmt.Sprintf("%x", sha256.Sum256(body))
-
-		requests[r.ID] = r
-	}
-
-	// w.rdb.SaveScreenshot("screenshot.png", 0644, 0, true)
-
-	return FetchResponse{}
-}
-
 func GetAvailablePort() uint {
 	l, _ := net.Listen("tcp", ":0")
 	parts := strings.Split(l.Addr().String(), ":")
@@ -536,6 +467,13 @@ func GetAvailablePort() uint {
 	p, _ := strconv.Atoi(parts[len(parts)-1])
 
 	return uint(p)
+}
+
+func PullImage(c *docker.Client, img string) error {
+	return c.PullImage(docker.PullImageOptions{
+		Repository: img,
+		Tag:        "latest",
+	}, docker.AuthConfiguration{})
 }
 
 func WaitForPort(port uint) {
@@ -547,5 +485,84 @@ func WaitForPort(port uint) {
 		}
 
 		time.Sleep(time.Second)
+	}
+}
+
+type workerController struct {
+	m         sync.Mutex
+	workers   []*Worker
+	dclient   *docker.Client
+	us        URLStore
+	tasks     chan CrawlRequest
+	responses chan CrawlSession
+	stop      chan bool
+}
+
+func NewWorkerController(us URLStore) (*workerController, error) {
+	dclient, err := docker.NewClient("unix:///var/run/docker.sock")
+	if err != nil {
+		return nil, err
+	}
+
+	tasks := make(chan CrawlRequest)
+	responses := make(chan CrawlSession)
+	stop := make(chan bool)
+
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			u, err := us.Sample()
+			if err != nil {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+
+			select {
+			case <-stop:
+				return
+			case tasks <- CrawlRequest{Url: u}:
+			}
+		}
+	}()
+
+	return &workerController{
+		tasks:     tasks,
+		responses: responses,
+		us:        us,
+		dclient:   dclient,
+		stop:      stop,
+	}, nil
+}
+
+func (wc *workerController) AddWorker() error {
+	wc.m.Lock()
+	defer wc.m.Unlock()
+
+	w, err := NewWorker(WorkerConfig{
+		Queue:        wc.tasks,
+		Responses:    wc.responses,
+		DockerClient: wc.dclient,
+	})
+	if err != nil {
+		return err
+	}
+	wc.workers = append(wc.workers, w)
+
+	return nil
+}
+
+func (wc *workerController) Close() {
+	wc.m.Lock()
+	defer wc.m.Unlock()
+
+	wc.stop <- true
+
+	for _, w := range wc.workers {
+		w.Close()
 	}
 }
