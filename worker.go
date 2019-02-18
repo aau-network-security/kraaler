@@ -480,7 +480,7 @@ func WaitForPort(port uint) {
 
 	endpoint := fmt.Sprintf("localhost:%d", port)
 	for {
-		conn, err := godet.Connect(endpoint, false)
+		conn, _ := godet.Connect(endpoint, false)
 		if conn != nil {
 			conn.Close()
 			break
