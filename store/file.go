@@ -7,11 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/aau-network-security/kraaler"
 )
 
 var (
@@ -167,4 +171,68 @@ func (fs *FileStore) Store(raw []byte) (StoredFile, error) {
 
 	fs.known[hash] = storedf
 	return storedf, nil
+}
+
+const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+const (
+	letterIdxBits = 6                    // 6 bits to represent a letter index
+	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
+	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
+)
+
+var src = rand.NewSource(time.Now().UnixNano())
+
+func randStringOfLen(n int) string {
+	b := make([]byte, n)
+	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
+	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
+		if remain == 0 {
+			cache, remain = src.Int63(), letterIdxMax
+		}
+		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
+			b[i] = letterBytes[idx]
+			i--
+		}
+		cache >>= letterIdxBits
+		remain--
+	}
+
+	return string(b)
+}
+
+type ScreenshotStore struct {
+	rootDir string
+}
+
+func NewScreenshotStore(dir string) *ScreenshotStore {
+	return &ScreenshotStore{dir}
+}
+
+func (ss *ScreenshotStore) Store(s kraaler.BrowserScreenshot, domain string) error {
+	filename := fmt.Sprintf(
+		"%s-%s.%s",
+		randStringOfLen(16),
+		s.Resolution,
+		strings.ToLower(s.Kind),
+	)
+
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	if domain == "" {
+		return fmt.Errorf("domain cannot be empty")
+	}
+
+	folder := filepath.Join(ss.rootDir, domain)
+	if err := os.MkdirAll(folder, os.ModePerm); err != nil {
+		return err
+	}
+
+	path := filepath.Join(folder, filename)
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = f.Write(s.Screenshot)
+	return err
 }

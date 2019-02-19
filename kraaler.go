@@ -233,6 +233,8 @@ func randomPickWeighted(rd *rand.Rand, m map[*url.URL]int) *url.URL {
 
 type BrowserScreenshot struct {
 	Screenshot []byte
+	Resolution Resolution
+	Kind       string
 	Taken      time.Time
 }
 

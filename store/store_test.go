@@ -1,11 +1,16 @@
 package store
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/aau-network-security/kraaler"
 )
 
 func TestFileStore(t *testing.T) {
@@ -80,6 +85,73 @@ func TestFileStore(t *testing.T) {
 				t.Fatalf("unexpected amount of files in store (expected: %d): %d", tc.amount, len(files))
 			}
 
+		})
+	}
+}
+
+func TestScreenshotStore(t *testing.T) {
+	tt := []struct {
+		name       string
+		domain     string
+		screenshot kraaler.BrowserScreenshot
+	}{
+		{name: "basic", domain: "test.com", screenshot: kraaler.BrowserScreenshot{
+			Screenshot: []byte(`not_image_bytes`),
+			Resolution: kraaler.Resolution{800, 600},
+			Kind:       "png",
+			Taken:      time.Now(),
+		}},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, err := ioutil.TempDir("", fmt.Sprintf("kraaler-screenshotstore-test-%s", tc.name))
+			if err != nil {
+				t.Fatalf("error when creating temp dir: %s", err)
+			}
+			defer os.RemoveAll(dir)
+
+			ss := NewScreenshotStore(dir)
+			if err := ss.Store(tc.screenshot, tc.domain); err != nil {
+				t.Fatalf("error when storing in screenshot store: %s", err)
+			}
+
+			folders, err := ioutil.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("unable to read temp dir: %s", err)
+			}
+
+			if len(folders) != 1 {
+				t.Fatalf("expected one folder to be created")
+			}
+
+			domainDir := filepath.Join(dir, folders[0].Name())
+			files, err := ioutil.ReadDir(domainDir)
+			if err != nil {
+				t.Fatalf("unable to read temp dir: %s", err)
+			}
+
+			if len(files) != 1 {
+				t.Fatalf("expected one file to be created")
+			}
+
+			file := files[0].Name()
+			if ext := "." + tc.screenshot.Kind; !strings.HasSuffix(file, ext) {
+				t.Fatalf("expected file (%s) to have extension: %s", file, ext)
+			}
+
+			if res := tc.screenshot.Resolution.String(); !strings.Contains(file, res) {
+				t.Fatalf("expected file (%s) to contain resolution: %s", file, res)
+			}
+
+			content, err := ioutil.ReadFile(filepath.Join(domainDir, file))
+			if err != nil {
+				t.Fatalf("unable to read screenshot file: %s", err)
+			}
+
+			if bytes.Compare(content, tc.screenshot.Screenshot) != 0 {
+				t.Fatalf("expected file to be stored directly without modification")
+			}
 		})
 	}
 }
