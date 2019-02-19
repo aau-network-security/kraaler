@@ -2,6 +2,7 @@ module github.com/aau-network-security/kraaler
 
 require (
 	github.com/PuerkitoBio/goquery v1.5.0
+	github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869 // indirect
 	github.com/fsouza/go-dockerclient v1.3.6
 	github.com/gizak/termui v2.3.0+incompatible
 	github.com/gobs/httpclient v0.0.0-20190208174033-8a2ca60ff01e // indirect
@@ -9,6 +10,7 @@ require (
 	github.com/gobs/simplejson v0.0.0-20181106204727-c70e6bd5e26b // indirect
 	github.com/google/uuid v1.1.0
 	github.com/gorilla/websocket v1.4.0 // indirect
+	github.com/kr/pretty v0.1.0 // indirect
 	github.com/maruel/panicparse v1.1.1 // indirect
 	github.com/mattn/go-runewidth v0.0.4 // indirect
 	github.com/mattn/go-sqlite3 v1.10.0

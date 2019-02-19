@@ -119,7 +119,7 @@ func codesAre(codes ...int) validator {
 
 		for i, c := range codes {
 			if sc := s.Actions[i].Response.StatusCode; sc != c {
-				return fmt.Errorf("expected action with index %d to be %d (status code), but it is:%d", i, c, sc)
+				return fmt.Errorf("expected action with index %d to be %d (status code), but it is: %d", i, c, sc)
 			}
 		}
 
@@ -127,10 +127,26 @@ func codesAre(codes ...int) validator {
 	}
 }
 
-func bodyIs(str string) validator {
+func bodiesAre(bodies ...string) validator {
+	return func(s kraaler.CrawlSession) error {
+		if len(bodies) != len(s.Actions) {
+			return fmt.Errorf("expected %d bodies, but received: %d", len(bodies), len(s.Actions))
+		}
+
+		for i, b := range bodies {
+			if fetched := strings.TrimSpace(string(s.Actions[i].Response.Body)); fetched != b {
+				return fmt.Errorf("unexpected body (%s), expected: %s", fetched, b)
+			}
+		}
+
+		return nil
+	}
+}
+
+func mimeIs(str string) validator {
 	return func(s kraaler.CrawlSession) error {
 		actions := s.Actions
-		if b := strings.TrimSpace(string(actions[len(actions)-1].Response.Body)); b != str {
+		if b := strings.TrimSpace(string(actions[len(actions)-1].Response.MimeType)); b != str {
 			return fmt.Errorf("unexpected body (%s), expected: %s", b, str)
 		}
 		return nil
@@ -179,14 +195,24 @@ func consoleIs(c []string) validator {
 }
 
 func TestCrawl(t *testing.T) {
-	txtHandler := func(s string) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, s) })
+	txtHandler := func(s string, sc int) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(sc); fmt.Fprintln(w, s) })
 	}
 
 	redirectHandler := http.NewServeMux()
 	redirectHandler.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/other", 301) })
 	redirectHandler.HandleFunc("/other", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/last", 301) })
 	redirectHandler.HandleFunc("/last", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "hello world") })
+
+	multiHandler := http.NewServeMux()
+	multiHandlerRootBody := `<html><body><img src="/img"/></body></html>`
+	multiHandler.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, multiHandlerRootBody)
+	})
+	multiHandler.HandleFunc("/img", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintln(w, "not found")
+	})
 
 	tt := []struct {
 		name      string
@@ -195,21 +221,32 @@ func TestCrawl(t *testing.T) {
 	}{
 		{
 			name:    "basic",
-			handler: txtHandler("hello world"),
+			handler: txtHandler("hello world", http.StatusOK),
 			validator: join(
 				hasActionCount(1),
-				bodyIs("hello world"),
+				bodiesAre("hello world"),
 				codesAre(http.StatusOK),
+				mimeIs("text/plain"),
 			),
 		},
-
+		{
+			name:    "not found status",
+			handler: txtHandler("not found", http.StatusNotFound),
+			validator: join(
+				hasActionCount(1),
+				bodiesAre("not found"),
+				codesAre(http.StatusNotFound),
+				mimeIs("text/plain"),
+			),
+		},
 		{
 			name:    "console",
-			handler: txtHandler("<script>console.log('a a');console.log('b')</script>"),
+			handler: txtHandler("<script>console.log('a a');console.log('b')</script>", http.StatusOK),
 			validator: join(
 				hasActionCount(1),
 				consoleIs([]string{"a a", "b"}),
 				codesAre(http.StatusOK),
+				mimeIs("text/html"),
 			),
 		},
 		{
@@ -218,7 +255,18 @@ func TestCrawl(t *testing.T) {
 			validator: join(
 				hasActionCount(3),
 				codesAre(http.StatusMovedPermanently, http.StatusMovedPermanently, http.StatusOK),
-				bodyIs("hello world"),
+				bodiesAre("", "", "hello world"),
+				mimeIs("text/plain"),
+			),
+		},
+		{
+			name:    "basic html parsing",
+			handler: multiHandler,
+			validator: join(
+				hasActionCount(2),
+				bodiesAre(multiHandlerRootBody, "not found"),
+				codesAre(http.StatusOK, http.StatusNotFound),
+				mimeIs("text/plain"),
 			),
 		},
 	}
