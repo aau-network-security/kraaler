@@ -19,8 +19,8 @@ import (
 
 var (
 	chromeBinaries = []string{
-		"google-chrome-stable", // used by travis
 		"chromium",             // used by linux
+		"google-chrome-stable", // used by travis
 	}
 	chromeBinary = ""
 )
