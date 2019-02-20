@@ -1,75 +1,57 @@
 package kraaler_test
 
 import (
-	"flag"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aau-network-security/kraaler"
 	docker "github.com/fsouza/go-dockerclient"
 )
 
-var travis bool
+var (
+	chromeBinaries = []string{
+		"google-chrome-stable", // used by travis
+		"chromium",             // used by linux
+	}
+	chromeBinary = ""
+)
 
 func init() {
-	flag.BoolVar(&travis, "travis", false, "is the tester travis")
-	flag.Parse()
+	for _, b := range chromeBinaries {
+		path, _ := exec.LookPath(b)
+		if path != "" {
+			chromeBinary = path
+			break
+		}
+	}
 }
 
-func dockerInterfaceIP() (string, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "", err
-	}
+func getAvailablePort() uint {
+	l, _ := net.Listen("tcp", ":0")
+	parts := strings.Split(l.Addr().String(), ":")
+	l.Close()
 
-	for _, i := range ifaces {
-		if i.Name != "docker0" {
-			continue
-		}
+	p, _ := strconv.Atoi(parts[len(parts)-1])
 
-		addrs, err := i.Addrs()
-		if err != nil {
-			return "", err
-		}
-
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-
-			return fmt.Sprintf("%s", ip), nil
-		}
-
-	}
-
-	return "", nil
+	return uint(p)
 }
 
-func responseFromServerWithHandler(handler http.Handler) (*kraaler.CrawlSession, error) {
-	dip, err := dockerInterfaceIP()
-	if err != nil {
-		return nil, err
-	}
-
-	addr := fmt.Sprintf("%s:%d", dip, kraaler.GetAvailablePort())
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-
+func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool, dur *time.Duration) (*kraaler.CrawlSession, error) {
 	ts := httptest.NewUnstartedServer(handler)
-	ts.Listener.Close()
-	ts.Listener = l
-	ts.Start()
+	if useTLS {
+		ts.StartTLS()
+	} else {
+		ts.Start()
+	}
 	defer ts.Close()
 
 	q := make(chan kraaler.CrawlRequest, 1)
@@ -79,30 +61,30 @@ func responseFromServerWithHandler(handler http.Handler) (*kraaler.CrawlSession,
 		return nil, err
 	}
 
-	var instance string
-	if travis {
-		instance = "localhost:9222"
-	}
-
 	w, err := kraaler.NewWorker(kraaler.WorkerConfig{
 		Queue:        q,
 		Responses:    resps,
 		DockerClient: dclient,
-		UseInstance:  instance,
+		UseInstance:  fmt.Sprintf("localhost:%d", port),
 	})
 	if err != nil {
 		return nil, err
 	}
 	defer w.Close()
 
-	endpoint := fmt.Sprintf("http://%s", addr)
-	u, err := url.Parse(endpoint)
+	u, err := url.Parse(ts.URL)
 	if err != nil {
 		return nil, err
 	}
 
+	var screenshots []time.Duration
+	if dur != nil {
+		screenshots = []time.Duration{*dur}
+	}
+
 	q <- kraaler.CrawlRequest{
-		Url: u,
+		Url:         u,
+		Screenshots: screenshots,
 	}
 
 	r := <-resps
@@ -136,6 +118,22 @@ func bodiesAre(bodies ...string) validator {
 		for i, b := range bodies {
 			if fetched := strings.TrimSpace(string(s.Actions[i].Response.Body)); fetched != b {
 				return fmt.Errorf("unexpected body (%s), expected: %s", fetched, b)
+			}
+		}
+
+		return nil
+	}
+}
+
+func initiatorsAre(inits ...string) validator {
+	return func(s kraaler.CrawlSession) error {
+		if len(inits) != len(s.Actions) {
+			return fmt.Errorf("expected %d initators, but received: %d", len(inits), len(s.Actions))
+		}
+
+		for i, expected := range inits {
+			if init := strings.TrimSpace(string(s.Actions[i].Initiator)); init != expected {
+				return fmt.Errorf("unexpected initiator (%s), expected: %s", init, expected)
 			}
 		}
 
@@ -194,7 +192,36 @@ func consoleIs(c []string) validator {
 	}
 }
 
+func postDataIs(str string) validator {
+	return func(s kraaler.CrawlSession) error {
+		postdata := s.Actions[len(s.Actions)-1].Request.PostData
+		if postdata == nil {
+			return fmt.Errorf("expected post data to be (%s), but it is nil", str)
+		}
+
+		if *postdata != str {
+			return fmt.Errorf("expected post data to be (%s), but received: %s", str, *postdata)
+		}
+
+		return nil
+	}
+}
+
+func securityDetailsPresent(s kraaler.CrawlSession) error {
+	for i, a := range s.Actions {
+		if a.SecurityDetails == nil {
+			return fmt.Errorf("expected security details to be non-nil (request n: %d)", i+1)
+		}
+	}
+
+	return nil
+}
+
 func TestCrawl(t *testing.T) {
+	if chromeBinary == "" {
+		t.Fatal("unable to locate chrome binary")
+	}
+
 	txtHandler := func(s string, sc int) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(sc); fmt.Fprintln(w, s) })
 	}
@@ -217,6 +244,8 @@ func TestCrawl(t *testing.T) {
 	tt := []struct {
 		name      string
 		handler   http.Handler
+		tls       bool
+		wait      time.Duration
 		validator validator
 	}{
 		{
@@ -224,9 +253,23 @@ func TestCrawl(t *testing.T) {
 			handler: txtHandler("hello world", http.StatusOK),
 			validator: join(
 				hasActionCount(1),
+				initiatorsAre("user"),
 				bodiesAre("hello world"),
 				codesAre(http.StatusOK),
 				mimeIs("text/plain"),
+			),
+		},
+		{
+			name:    "basic tls",
+			handler: txtHandler("hello world", http.StatusOK),
+			tls:     true,
+			validator: join(
+				hasActionCount(1),
+				initiatorsAre("user"),
+				bodiesAre("hello world"),
+				codesAre(http.StatusOK),
+				mimeIs("text/plain"),
+				securityDetailsPresent,
 			),
 		},
 		{
@@ -234,6 +277,7 @@ func TestCrawl(t *testing.T) {
 			handler: txtHandler("not found", http.StatusNotFound),
 			validator: join(
 				hasActionCount(1),
+				initiatorsAre("user"),
 				bodiesAre("not found"),
 				codesAre(http.StatusNotFound),
 				mimeIs("text/plain"),
@@ -244,6 +288,7 @@ func TestCrawl(t *testing.T) {
 			handler: txtHandler("<script>console.log('a a');console.log('b')</script>", http.StatusOK),
 			validator: join(
 				hasActionCount(1),
+				initiatorsAre("user"),
 				consoleIs([]string{"a a", "b"}),
 				codesAre(http.StatusOK),
 				mimeIs("text/html"),
@@ -254,26 +299,63 @@ func TestCrawl(t *testing.T) {
 			handler: redirectHandler,
 			validator: join(
 				hasActionCount(3),
+				initiatorsAre("user", "redirect", "redirect"),
 				codesAre(http.StatusMovedPermanently, http.StatusMovedPermanently, http.StatusOK),
 				bodiesAre("", "", "hello world"),
 				mimeIs("text/plain"),
 			),
 		},
 		{
-			name:    "basic html parsing",
+			name:    "html parsing",
 			handler: multiHandler,
 			validator: join(
 				hasActionCount(2),
+				initiatorsAre("user", "parser"),
 				bodiesAre(multiHandlerRootBody, "not found"),
 				codesAre(http.StatusOK, http.StatusNotFound),
 				mimeIs("text/plain"),
+			),
+		},
+		{
+			name:    "post data",
+			handler: txtHandler("<script>var xhr = new XMLHttpRequest(); xhr.open('POST', '/poster'); xhr.send('some_data');</script>", http.StatusOK),
+			wait:    500 * time.Millisecond,
+			validator: join(
+				hasActionCount(2),
+				initiatorsAre("user", "script"),
+				codesAre(http.StatusOK, http.StatusOK),
+				mimeIs("text/html"),
+				postDataIs("some_data"),
 			),
 		},
 	}
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := responseFromServerWithHandler(tc.handler)
+			port := getAvailablePort()
+			cmd := exec.Command(chromeBinary,
+				"--headless",
+				"--ignore-certificate-errors",
+				"--disable-gpu",
+				fmt.Sprintf("--remote-debugging-port=%d", port),
+				"http://localhost")
+
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("unable to start chrome: %s", err)
+			}
+			defer func() {
+				if err := cmd.Process.Kill(); err != nil {
+					log.Fatal("failed to kill process: ", err)
+				}
+			}()
+
+			var wait *time.Duration
+			var ti time.Duration
+			if tc.wait != ti {
+				wait = &tc.wait
+			}
+
+			resp, err := responseFromServerWithHandler(tc.handler, port, tc.tls, wait)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -2,6 +2,7 @@ package kraaler
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -32,9 +33,11 @@ type NoParamErr struct{ param string }
 
 func (npe *NoParamErr) Error() string { return fmt.Sprintf("unable to get param: %s", npe.param) }
 
-type NotOfTypeErr struct{ kind string }
+type NotOfTypeErr struct{ value, kind string }
 
-func (note *NotOfTypeErr) Error() string { return fmt.Sprintf("value is not of type: %s", note.kind) }
+func (note *NotOfTypeErr) Error() string {
+	return fmt.Sprintf("value (\"%s\") is not of type: %s", note.value, note.kind)
+}
 
 type Worker struct {
 	id        string
@@ -261,7 +264,7 @@ func (w *Worker) fetch(req CrawlRequest) CrawlSession {
 
 	var wg sync.WaitGroup
 	capture := func(d time.Duration) {
-		time.Sleep(3 * time.Second)
+		time.Sleep(d)
 		ss, err := w.CaptureScreenshot()
 		if err != nil {
 			log.Printf("unable to capture screenshot: %s", err)
@@ -276,6 +279,7 @@ func (w *Worker) fetch(req CrawlRequest) CrawlSession {
 		capture(timing)
 	}
 
+	m.Lock()
 	for id, eps := range raw {
 		body, err := w.rdb.GetResponseBody(id)
 		if err != nil {
@@ -284,8 +288,9 @@ func (w *Worker) fetch(req CrawlRequest) CrawlSession {
 		}
 
 		params := map[string]interface{}{
-			"body":   body,
-			"sha256": fmt.Sprintf("%x", sha256.Sum256(body)),
+			"requestId": id,
+			"body":      body,
+			"sha256":    fmt.Sprintf("%x", sha256.Sum256(body)),
 		}
 
 		raw[id] = append(eps, ChromeEventParam{
@@ -293,6 +298,7 @@ func (w *Worker) fetch(req CrawlRequest) CrawlSession {
 			params: params,
 		})
 	}
+	m.Unlock()
 
 	wg.Wait()
 	var capturedScreenshots []*BrowserScreenshot
@@ -342,6 +348,7 @@ func (w *Worker) Close() {
 }
 
 func ActionsFromEvents(logs map[string][]ChromeEventParam) []*CrawlAction {
+	requests := map[string]*CrawlAction{}
 	requestIsSent := func(params map[string]interface{}, last *CrawlAction) (*CrawlAction, error) {
 		_, performedRedirect := params["redirectResponse"].(map[string]interface{})
 		if performedRedirect && last != nil {
@@ -360,12 +367,19 @@ func ActionsFromEvents(logs map[string][]ChromeEventParam) []*CrawlAction {
 			return nil, err
 		}
 
-		switch {
-		case last == nil:
-			a.Initiator = "user"
-		case performedRedirect:
+		rid, ok := params["requestId"].(string)
+		if ok {
+			requests[rid] = a
+		}
+
+		if id, ok := params["loaderId"].(string); ok {
+			if parent, ok := requests[id]; ok && rid != id {
+				a.Parent = parent
+			}
+		}
+
+		if performedRedirect {
 			a.Initiator = "redirect"
-		default:
 		}
 
 		return a, nil
@@ -393,11 +407,17 @@ func ActionsFromEvents(logs map[string][]ChromeEventParam) []*CrawlAction {
 				}
 
 			case CHROME_RESP_RECEIVED:
-				if last == nil {
+				id, ok := ep.params["requestId"].(string)
+				if !ok {
 					continue
 				}
 
-				err := last.ReadResponse(ep.params, "response")
+				a, ok := requests[id]
+				if !ok {
+					continue
+				}
+
+				err := a.ReadResponse(ep.params, "response")
 				if err != nil {
 					log.Printf("error handling \"%s\": %s\n", CHROME_RESP_RECEIVED, err)
 				}
@@ -409,19 +429,37 @@ func ActionsFromEvents(logs map[string][]ChromeEventParam) []*CrawlAction {
 				}
 
 			case CUSTOM_GOT_BODY:
-				if last == nil {
+				id, ok := ep.params["requestId"].(string)
+				if !ok {
 					continue
 				}
 
-				last.Response.Body, _ = ep.params["body"].([]byte)
-				last.Response.BodyChecksumSha256, _ = ep.params["sha256"].(string)
+				a, ok := requests[id]
+				if !ok {
+					continue
+				}
+
+				a.Response.Body, _ = ep.params["body"].([]byte)
+				a.Response.BodyChecksumSha256, _ = ep.params["sha256"].(string)
 			}
 		}
 
 		sessionActions = append(sessionActions, actions...)
 	}
 
-	sort.Slice(sessionActions, func(i, j int) bool { return sessionActions[i].Timings.StartTime < sessionActions[j].Timings.StartTime })
+	sort.Slice(sessionActions,
+		func(i, j int) bool {
+			return sessionActions[i].Timings.StartTime < sessionActions[j].Timings.StartTime
+		})
+
+	if len(sessionActions) > 0 {
+		sessionActions[0].Initiator = "user"
+	}
+
+	for _, a := range sessionActions {
+		j, _ := json.MarshalIndent(a, "", "  ")
+		fmt.Println(string(j))
+	}
 
 	return sessionActions
 }
@@ -434,10 +472,38 @@ func ReadStringFromParams(key string, params map[string]interface{}) (string, er
 
 	vStr, ok := v.(string)
 	if !ok {
-		return "", &NotOfTypeErr{"string"}
+		return "", &NotOfTypeErr{key, "string"}
 	}
 
 	return vStr, nil
+}
+
+func ReadStringSliceFromParams(key string, params map[string]interface{}) ([]string, error) {
+	v, ok := params[key]
+	if !ok {
+		return nil, &NoParamErr{key}
+	}
+
+	notArray := func() ([]string, error) {
+		return nil, &NotOfTypeErr{key, "[]string"}
+	}
+
+	inters, ok := v.([]interface{})
+	if !ok {
+		return notArray()
+	}
+
+	var result []string
+	for _, i := range inters {
+		str, ok := i.(string)
+		if !ok {
+			return notArray()
+		}
+
+		result = append(result, str)
+	}
+
+	return result, nil
 }
 
 func ReadFloatFromParams(key string, params map[string]interface{}) (float64, error) {
@@ -448,7 +514,7 @@ func ReadFloatFromParams(key string, params map[string]interface{}) (float64, er
 
 	vFloat, ok := v.(float64)
 	if !ok {
-		return 0, &NotOfTypeErr{"float64"}
+		return 0, &NotOfTypeErr{key, "float64"}
 	}
 
 	return vFloat, nil
@@ -462,7 +528,7 @@ func GetParamsFromParams(key string, params map[string]interface{}) (map[string]
 
 	vMap, ok := v.(map[string]interface{})
 	if !ok {
-		return nil, &NotOfTypeErr{"map[string]interface{}"}
+		return nil, &NotOfTypeErr{key, "map[string]interface{}"}
 	}
 
 	return vMap, nil

@@ -331,11 +331,13 @@ func (ca *CrawlAction) ReadResponse(params map[string]interface{}, key string) e
 	}
 
 	var resp BrowserResponse
-	if err := resp.Read(params, key); err != nil {
+	sec, err := resp.Read(params, key)
+	if err != nil {
 		return err
 	}
 
 	ca.Response = &resp
+	ca.SecurityDetails = sec
 
 	respz, err := GetParamsFromParams(key, params)
 	if err != nil {
@@ -413,26 +415,30 @@ type BrowserResponse struct {
 	BodyChecksumSha256 string
 }
 
-func (br *BrowserResponse) Read(params map[string]interface{}, key string) error {
+func (br *BrowserResponse) Read(params map[string]interface{}, key string) (*BrowserSecurityDetails, error) {
+	noParam := func(p string) (*BrowserSecurityDetails, error) {
+		return nil, &NoParamErr{p}
+	}
+
 	rawResp, ok := params[key].(map[string]interface{})
 	if !ok {
-		return &NoParamErr{"response"}
+		return noParam("response")
 	}
 
 	br.MimeType, ok = rawResp["mimeType"].(string)
 	if !ok {
-		return &NoParamErr{"mimeType"}
+		return noParam("mimeType")
 	}
 
 	rawStatus, ok := rawResp["status"].(float64)
 	if !ok {
-		return &NoParamErr{"status"}
+		return noParam("status")
 	}
 	br.StatusCode = int(rawStatus)
 
 	rawHeaders, ok := rawResp["headers"].(map[string]interface{})
 	if !ok {
-		return &NoParamErr{"headers"}
+		return noParam("headers")
 	}
 
 	br.Headers = map[string]string{}
@@ -442,7 +448,17 @@ func (br *BrowserResponse) Read(params map[string]interface{}, key string) error
 		br.Headers[k] = vStr
 	}
 
-	return nil
+	var sec BrowserSecurityDetails
+	sd, ok := rawResp["securityDetails"].(map[string]interface{})
+	if ok {
+		if err := sec.Read(sd); err != nil {
+			return nil, err
+		}
+
+		return &sec, nil
+	}
+
+	return nil, nil
 }
 
 type BrowserTimes struct {
@@ -480,4 +496,52 @@ type BrowserSecurityDetails struct {
 	Issuer      string
 	ValidFrom   time.Time
 	ValidTo     time.Time
+}
+
+func (bsd *BrowserSecurityDetails) Read(params map[string]interface{}) error {
+	var err error
+	bsd.Protocol, err = ReadStringFromParams("protocol", params)
+	if err != nil {
+		return err
+	}
+
+	bsd.KeyExchange, err = ReadStringFromParams("keyExchange", params)
+	if err != nil {
+		return err
+	}
+
+	bsd.Cipher, err = ReadStringFromParams("cipher", params)
+	if err != nil {
+		return err
+	}
+
+	bsd.SubjectName, err = ReadStringFromParams("subjectName", params)
+	if err != nil {
+		return err
+	}
+
+	bsd.SanList, err = ReadStringSliceFromParams("sanList", params)
+	if err != nil {
+		return err
+	}
+
+	bsd.Issuer, err = ReadStringFromParams("issuer", params)
+	if err != nil {
+		return err
+	}
+
+	timeFrom, err := ReadFloatFromParams("validFrom", params)
+	if err != nil {
+		return err
+	}
+	start := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	bsd.ValidFrom = start.Add(time.Duration(timeFrom) * time.Second)
+
+	timeTo, err := ReadFloatFromParams("validTo", params)
+	if err != nil {
+		return err
+	}
+	bsd.ValidTo = start.Add(time.Duration(timeTo) * time.Second)
+
+	return nil
 }

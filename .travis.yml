@@ -22,10 +22,6 @@ go:
 git:
   depth: 1
 
-before_install:
-  - google-chrome-stable --version
-  - google-chrome-stable --headless --disable-gpu --remote-debugging-port=9222 http://localhost &
-
 install: true
 
 # Don't email me the results of the test runs.
@@ -43,5 +39,5 @@ notifications:
 # .golangci.yml file at the top level of your repo.
 script:
   # - golangci-lint run       # run a bunch of code checkers/linters in parallel
-  - go test -v -timeout 2m -travis
+  - go test -v
   - go test -v ./store
