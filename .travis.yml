@@ -8,6 +8,7 @@ cache:
   directories:
     - $HOME/.cache/go-build
     - $HOME/gopath/pkg/mod
+    - $HOME/downloads
 
 # Force-enable Go modules. This will be unnecessary when Go 1.12 lands.
 env:
@@ -23,9 +24,9 @@ git:
   depth: 1
 
 before_install:
-  - wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-  - sudo dpkg -i google-chrome-stable_current_amd64.deb
-  - google-chrome-stable --version
+  - mkdir -p $HOME/downloads
+  - wget -N https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O $HOME/downloads/google-chrome-stable.deb
+  - sudo dpkg -i $HOME/downloads/google-chrome-stable.deb
 
 install: true
 
