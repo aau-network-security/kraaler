@@ -439,8 +439,10 @@ func ActionsFromEvents(logs map[string][]ChromeEventParam) []*CrawlAction {
 					continue
 				}
 
-				fmt.Println("response: ", a.Response)
-				fmt.Println("params: ", ep.params)
+				if a.Response == nil {
+					var resp BrowserResponse
+					a.Response = &resp
+				}
 
 				a.Response.Body, _ = ep.params["body"].([]byte)
 				a.Response.BodyChecksumSha256, _ = ep.params["sha256"].(string)

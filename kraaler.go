@@ -330,13 +330,16 @@ func (ca *CrawlAction) ReadResponse(params map[string]interface{}, key string) e
 		return err
 	}
 
-	var resp BrowserResponse
-	sec, err := resp.Read(params, key)
+	if ca.Response == nil {
+		var resp BrowserResponse
+		ca.Response = &resp
+	}
+
+	sec, err := ca.Response.Read(params, key)
 	if err != nil {
 		return err
 	}
 
-	ca.Response = &resp
 	ca.SecurityDetails = sec
 
 	respz, err := GetParamsFromParams(key, params)
