@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -419,6 +420,8 @@ func ActionsFromEvents(logs map[string][]ChromeEventParam) []*CrawlAction {
 
 		sessionActions = append(sessionActions, actions...)
 	}
+
+	sort.Slice(sessionActions, func(i, j int) bool { return sessionActions[i].Timings.StartTime < sessionActions[j].Timings.StartTime })
 
 	return sessionActions
 }
