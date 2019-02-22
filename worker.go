@@ -3,6 +3,7 @@ package kraaler
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -22,6 +23,10 @@ const (
 	CHROME_RESP_RECEIVED    = "Network.responseReceived"
 	CHROME_LOADING_FAILED   = "Network.loadingFailed"
 	CUSTOM_GOT_BODY         = "Custom.body"
+)
+
+var (
+	FuncTimeoutErr = errors.New("timeout")
 )
 
 var DefaultResolution = &Resolution{
@@ -55,6 +60,7 @@ type WorkerConfig struct {
 	DockerClient *docker.Client
 	UseInstance  string
 	Resolution   *Resolution
+	LoadTimeout  *time.Duration
 }
 
 func NewWorker(conf WorkerConfig) (*Worker, error) {
@@ -68,12 +74,17 @@ func NewWorker(conf WorkerConfig) (*Worker, error) {
 		return werr(fmt.Errorf("response chan is nil"))
 	}
 
-	if conf.DockerClient == nil {
-		return werr(fmt.Errorf("docker client cannot be nil"))
+	if conf.DockerClient == nil && conf.UseInstance == "" {
+		return werr(fmt.Errorf("docker client and existing instance cannot be nil at the same time"))
 	}
 
 	if conf.Resolution == nil {
 		conf.Resolution = DefaultResolution
+	}
+
+	if conf.LoadTimeout == nil {
+		timeout := 15 * time.Second
+		conf.LoadTimeout = &timeout
 	}
 
 	id := uuid.New().String()[0:8]
@@ -258,7 +269,13 @@ func (w *Worker) fetch(req CrawlRequest) CrawlSession {
 	if _, err := w.rdb.Navigate(req.Url.String()); err != nil {
 		return CrawlSession{Error: err}
 	}
-	loadedtime := <-stop
+	var loadedTime time.Time
+	select {
+	case t := <-stop:
+		loadedTime = t
+	case <-time.After(*w.conf.LoadTimeout):
+		return CrawlSession{Error: fmt.Errorf("Frame load timeout")}
+	}
 
 	screen := make(chan *BrowserScreenshot, 1)
 
@@ -314,7 +331,7 @@ func (w *Worker) fetch(req CrawlRequest) CrawlSession {
 		Console:        console,
 		Screenshots:    capturedScreenshots,
 		StartTime:      starttime,
-		LoadedTime:     loadedtime,
+		LoadedTime:     loadedTime,
 		TerminatedTime: terminateTime,
 	}
 }
@@ -653,5 +670,20 @@ func (wc *workerController) Close() {
 
 	for _, w := range wc.workers {
 		w.Close()
+	}
+}
+
+func timeoutAction(f func() error, d time.Duration) error {
+	errc := make(chan error, 1)
+
+	go func() {
+		errc <- f()
+	}()
+
+	select {
+	case err := <-errc:
+		return err
+	case <-time.After(d):
+		return FuncTimeoutErr
 	}
 }

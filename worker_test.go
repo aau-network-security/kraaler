@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/aau-network-security/kraaler"
-	docker "github.com/fsouza/go-dockerclient"
 )
 
 var (
@@ -47,25 +46,25 @@ func getAvailablePort() uint {
 
 func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool, dur *time.Duration) (*kraaler.CrawlSession, error) {
 	ts := httptest.NewUnstartedServer(handler)
-	if useTLS {
-		ts.StartTLS()
-	} else {
-		ts.Start()
+	if handler != nil {
+		if useTLS {
+			ts.StartTLS()
+		} else {
+			ts.Start()
+		}
 	}
+
 	defer ts.Close()
 
 	q := make(chan kraaler.CrawlRequest, 1)
 	resps := make(chan kraaler.CrawlSession, 1)
-	dclient, err := docker.NewClient("unix:///var/run/docker.sock")
-	if err != nil {
-		return nil, err
-	}
 
+	second := time.Second
 	w, err := kraaler.NewWorker(kraaler.WorkerConfig{
-		Queue:        q,
-		Responses:    resps,
-		DockerClient: dclient,
-		UseInstance:  fmt.Sprintf("localhost:%d", port),
+		Queue:       q,
+		Responses:   resps,
+		UseInstance: fmt.Sprintf("localhost:%d", port),
+		LoadTimeout: &second,
 	})
 	if err != nil {
 		return nil, err
@@ -226,6 +225,18 @@ func TestCrawl(t *testing.T) {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(sc); fmt.Fprintln(w, s) })
 	}
 
+	closerHandler := http.NewServeMux()
+	closerHandler.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "can't hijack rw", http.StatusInternalServerError)
+			return
+		}
+
+		conn, _, _ := hj.Hijack()
+		conn.Close()
+	})
+
 	redirectHandler := http.NewServeMux()
 	redirectHandler.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/other", 301) })
 	redirectHandler.HandleFunc("/other", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/last", 301) })
@@ -270,6 +281,13 @@ func TestCrawl(t *testing.T) {
 				codesAre(http.StatusOK),
 				mimeIs("text/plain"),
 				securityDetailsPresent,
+			),
+		},
+		{
+			name:    "no server",
+			handler: nil,
+			validator: join(
+				hasActionCount(0),
 			),
 		},
 		{
