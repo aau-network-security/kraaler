@@ -326,6 +326,7 @@ func (w *Worker) fetch(req CrawlRequest) CrawlSession {
 	terminateTime := time.Now()
 
 	return CrawlSession{
+		InitialURL:     req.Url.String(),
 		Resolution:     w.conf.Resolution.String(),
 		Actions:        ActionsFromEvents(raw),
 		Console:        console,
@@ -396,7 +397,7 @@ func ActionsFromEvents(logs map[string][]ChromeEventParam) []*CrawlAction {
 		}
 
 		if performedRedirect {
-			a.Initiator = "redirect"
+			a.Initiator.Kind = "redirect"
 		}
 
 		return a, nil
@@ -475,7 +476,7 @@ func ActionsFromEvents(logs map[string][]ChromeEventParam) []*CrawlAction {
 		})
 
 	if len(sessionActions) > 0 {
-		sessionActions[0].Initiator = "user"
+		sessionActions[0].Initiator.Kind = "user"
 	}
 
 	for _, a := range sessionActions {

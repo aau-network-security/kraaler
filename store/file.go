@@ -79,6 +79,7 @@ func WithMimeTypes(types ...MimeValidator) FileStoreOpt {
 
 type StoredFile struct {
 	HashType string
+	Hash     string
 	Path     string
 	OrgSize  int
 	CompSize int
@@ -120,14 +121,23 @@ func (fs *FileStore) mimeAllowed(mimeType string) bool {
 }
 
 func (fs *FileStore) Store(raw []byte) (StoredFile, error) {
-	sendErr := func(err error) (StoredFile, error) { return StoredFile{}, err }
-
+	hash := fs.hasher.Sum(raw)
 	mimeType := http.DetectContentType(raw)
+	storedf := StoredFile{
+		HashType: fs.hasher.Name(),
+		Hash:     hash,
+		OrgSize:  len(raw),
+		MimeType: mimeType,
+	}
+
+	sendErr := func(err error) (StoredFile, error) {
+		return storedf, err
+	}
+
 	if !fs.mimeAllowed(mimeType) {
 		return sendErr(NotAllowedMimeErr)
 	}
 
-	hash := fs.hasher.Sum(raw)
 	if storedf, ok := fs.known[hash]; ok {
 		return storedf, nil
 	}
@@ -150,6 +160,7 @@ func (fs *FileStore) Store(raw []byte) (StoredFile, error) {
 	if err != nil {
 		return sendErr(err)
 	}
+	storedf.Path = absFilepath
 
 	_, err = w.Write(raw)
 	if err != nil {
@@ -160,16 +171,10 @@ func (fs *FileStore) Store(raw []byte) (StoredFile, error) {
 	if err != nil {
 		return sendErr(err)
 	}
-
-	storedf := StoredFile{
-		Path:     absFilepath,
-		HashType: fs.hasher.Name(),
-		OrgSize:  len(raw),
-		CompSize: int(fi.Size()),
-		MimeType: mimeType,
-	}
+	storedf.CompSize = int(fi.Size())
 
 	fs.known[hash] = storedf
+
 	return storedf, nil
 }
 
@@ -208,7 +213,7 @@ func NewScreenshotStore(dir string) *ScreenshotStore {
 	return &ScreenshotStore{dir}
 }
 
-func (ss *ScreenshotStore) Store(s kraaler.BrowserScreenshot, domain string) error {
+func (ss *ScreenshotStore) Store(s *kraaler.BrowserScreenshot, domain string) (string, error) {
 	filename := fmt.Sprintf(
 		"%s-%s.%s",
 		randStringOfLen(16),
@@ -218,21 +223,25 @@ func (ss *ScreenshotStore) Store(s kraaler.BrowserScreenshot, domain string) err
 
 	domain = strings.TrimSpace(strings.ToLower(domain))
 	if domain == "" {
-		return fmt.Errorf("domain cannot be empty")
+		return "", fmt.Errorf("domain cannot be empty")
 	}
 
 	folder := filepath.Join(ss.rootDir, domain)
 	if err := os.MkdirAll(folder, os.ModePerm); err != nil {
-		return err
+		return "", err
 	}
 
 	path := filepath.Join(folder, filename)
 	f, err := os.Create(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 
 	_, err = f.Write(s.Screenshot)
-	return err
+	if err != nil {
+		return "", err
+	}
+
+	return filename, nil
 }

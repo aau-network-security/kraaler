@@ -131,7 +131,7 @@ func initiatorsAre(inits ...string) validator {
 		}
 
 		for i, expected := range inits {
-			if init := strings.TrimSpace(string(s.Actions[i].Initiator)); init != expected {
+			if init := strings.TrimSpace(string(s.Actions[i].Initiator.Kind)); init != expected {
 				return fmt.Errorf("unexpected initiator (%s), expected: %s", init, expected)
 			}
 		}
@@ -336,7 +336,7 @@ func TestCrawl(t *testing.T) {
 		},
 		{
 			name:    "post data",
-			handler: txtHandler("<script>var xhr = new XMLHttpRequest(); xhr.open('POST', '/poster'); xhr.send('some_data');</script>", http.StatusOK),
+			handler: txtHandler("<script>function hest() { var xhr = new XMLHttpRequest(); xhr.open('POST', '/poster'); xhr.send('some_data'); }; hest()</script>", http.StatusOK),
 			wait:    500 * time.Millisecond,
 			validator: join(
 				hasActionCount(2),

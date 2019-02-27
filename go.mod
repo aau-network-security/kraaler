@@ -17,5 +17,6 @@ require (
 	github.com/mitchellh/go-wordwrap v1.0.0 // indirect
 	github.com/mvdan/xurls v1.1.0
 	github.com/nsf/termbox-go v0.0.0-20190121233118-02980233997d // indirect
+	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/raff/godet v0.0.0-20181215041310-7f5db8f2b8ab
 )

@@ -238,8 +238,81 @@ type BrowserScreenshot struct {
 	Taken      time.Time
 }
 
+type CallFrame struct {
+	Column     int
+	LineNumber int
+	Url        string
+	Function   *string
+}
+
+type Initiator struct {
+	Kind  string
+	Stack *CallFrame
+}
+
+func NewInitiator(params map[string]interface{}) (Initiator, error) {
+	var init Initiator
+	var err error
+
+	sendErr := func(err error) (Initiator, error) { return Initiator{}, err }
+
+	init.Kind, err = ReadStringFromParams("type", params)
+	if err != nil {
+		return sendErr(err)
+	}
+
+	if _, ok := params["stack"]; ok {
+		stack, err := GetParamsFromParams("stack", params)
+		if err != nil {
+			return sendErr(err)
+		}
+
+		iframes, ok := stack["callFrames"].([]interface{})
+		if !ok {
+			return init, &NoParamErr{"callFrames"}
+		}
+
+		if len(iframes) == 0 {
+			return sendErr(fmt.Errorf("callFrames is empty"))
+		}
+
+		frame, ok := iframes[0].(map[string]interface{})
+		if !ok {
+			return sendErr(fmt.Errorf("callFrames is not map"))
+		}
+
+		var cf CallFrame
+		column, err := ReadFloatFromParams("columnNumber", frame)
+		if err != nil {
+			return sendErr(err)
+		}
+		cf.Column = int(column)
+
+		linenumber, err := ReadFloatFromParams("lineNumber", frame)
+		if err != nil {
+			return sendErr(err)
+		}
+		cf.LineNumber = int(linenumber)
+
+		funcName, err := ReadStringFromParams("functionName", frame)
+		if err != nil {
+			return sendErr(err)
+		}
+		cf.Function = &funcName
+
+		cf.Url, err = ReadStringFromParams("url", frame)
+		if err != nil {
+			return sendErr(err)
+		}
+
+		init.Stack = &cf
+	}
+
+	return init, nil
+}
+
 type CrawlSession struct {
-	ID             string
+	InitialURL     string
 	Actions        []*CrawlAction
 	Resolution     string
 	Console        []string
@@ -252,7 +325,7 @@ type CrawlSession struct {
 
 type CrawlAction struct {
 	Parent          *CrawlAction
-	Initiator       string
+	Initiator       Initiator
 	Protocol        *string
 	HostIP          *string
 	SecurityDetails *BrowserSecurityDetails
@@ -282,7 +355,7 @@ func NewCrawlActionFromParams(params map[string]interface{}) (*CrawlAction, erro
 		return nil, err
 	}
 
-	ca.Initiator, err = ReadStringFromParams("type", initz)
+	ca.Initiator, err = NewInitiator(initz)
 	if err != nil {
 		return nil, err
 	}

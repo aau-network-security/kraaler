@@ -1,27 +1,37 @@
 package store
 
-const initSql string = `
-create table dim_initiators (
+const (
+	sessionSchema = `
+create table dim_resolutions (
     id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL
+    resolution TEXT NOT NULL
 );
 
-create table dim_protocols (
+create table fact_sessions (
     id INTEGER PRIMARY KEY,
-    protocol TEXT NOT NULL
+    resolution_id INTEGER references dim_resolutions(id) NOT NULL,
+    start_time INTEGER NOT NULL,
+    loaded_time INTEGER NOT NULL,
+    terminated_time INTEGER NOT NULL,
+    amount_of_actions INTEGER NOT NULL,
+    error TEXT
 );
+`
+	consoleSchema = `
+create table fact_console_output (
+    session_id INTEGER references fact_sessions(id) NOT NULL,
+    seq INTEGER NOT NULL,
+    message TEXT NOT NULL
+);`
 
-create table dim_schemes (
-    id INTEGER PRIMARY KEY,
-    scheme TEXT NOT NULL,
-    protocol_id INTEGER references dim_procols(id) NOT NULL
-);
-
-create table dim_paths (
-    id INTEGER PRIMARY KEY,
+	screenshotSchema = `
+create table fact_screenshots (
+    session_id INTEGER references fact_sessions(id) NOT NULL,
+    time_taken INTEGER NOT NULL,
     path TEXT NOT NULL
-);
+);`
 
+	actionSchema = `
 create table dim_hosts (
     id INTEGER PRIMARY KEY,
     domain TEXT NOT NULL,
@@ -39,17 +49,71 @@ create table dim_methods (
     method TEXT NOT NULL
 );
 
-create table fact_actions (
+create table dim_protocols (
     id INTEGER PRIMARY KEY,
-    parent_id INTEGER references fact_action(id),
-    method_id INTEGER references dim_methods(id) NOT NULL,
-    scheme_id INTEGER references dim_scheme(id) NOT NULL,
-    path_id INTEGER references dim_paths(id) NOT NULL,
-    host_id INTEGER references dim_hosts(id) NOT NULL,
-    status_code INTEGER,
-    error_id INTEGER references dim_errors(id)
+    protocol TEXT NOT NULL
 );
 
+create table dim_initiators (
+    id INTEGER PRIMARY KEY,
+    initiator TEXT NOT NULL
+);
+
+create table fact_actions (
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER references fact_actions(id),
+    session_id INTEGER references fact_sessions(id) NOT NULL,
+    method_id INTEGER references dim_methods(id) NOT NULL,
+    protocol_id INTEGER references dim_procols(id) NOT NULL,
+    host_id INTEGER references dim_hosts(id) NOT NULL,
+    initiator_id INTEGER references dim_initiators(id) NOT NULL,
+    status_code INTEGER,
+    error_id INTEGER references dim_errors(id)
+);`
+
+	urlSchema = `
+create table dim_url_schemes (
+    id INTEGER PRIMARY KEY,
+    scheme TEXT NOT NULL
+);
+
+create table dim_url_users (
+    id INTEGER PRIMARY KEY,
+    user TEXT NOT NULL
+);
+
+create table dim_url_hosts (
+    id INTEGER PRIMARY KEY,
+    host TEXT NOT NULL
+);
+
+create table dim_url_paths (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL
+);
+
+create table dim_url_fragments (
+    id INTEGER PRIMARY KEY,
+    fragment TEXT NOT NULL
+);
+
+create table dim_url_raw_queries (
+    id INTEGER PRIMARY KEY,
+    query TEXT NOT NULL
+);
+
+create table fact_urls (
+    action_id INTEGER references fact_actions(id) NOT NULL,
+    scheme_id INTEGER references dim_url_schemes(id) NOT NULL,
+    user_id INTEGER references dim_url_users(id),
+    host_id INTEGER references dim_url_hosts(id) NOT NULL,
+    path_id INTEGER references dim_url_paths(id) NOT NULL,
+    fragment_id INTEGER references dim_url_fragments(id),
+    raw_query_id INTEGER references dim_url_raw_queries(id),
+    url TEXT NOT NULL
+);`
+
+	headerSchema = `
 create table dim_header_keys (
     id INTEGER PRIMARY KEY,
     key TEXT NOT NULL
@@ -69,18 +133,12 @@ create table fact_response_headers (
 create table fact_request_headers (
     action_id INTEGER references fact_action(id) NOT NULL,
     header_keyvalue_id INTEGER references dim_header_keyvalues(id) NOT NULL
-);
+);`
 
-create table fact_action_timings (
-    action_id INTEGER references fact_action(id) NOT NULL,
-    start_datetime NUMERIC NOT NULL,
-    end_datetime NUMERIC NOT NULL,
-    connect_start_time NUMERIC,
-    connect_end_time NUMERIC,
-    send_start_time NUMERIC,
-    send_end_time NUMERIC,
-    push_start_time NUMERIC,
-    push_end_time NUMERIC
+	securitySchema = `
+create table if not exists dim_protocols (
+    id INTEGER PRIMARY KEY,
+    protocol TEXT NOT NULL
 );
 
 create table dim_issuers (
@@ -111,10 +169,11 @@ create table fact_security_details (
     cipher_id INTEGER references dim_cipher(id) NOT NULL,
     san_list_id INTEGER references dim_san_lists(id) NOT NULL,
     subject_name TEXT NOT NULL,
-    valid_from NUMERIC NOT NULL,
-    valid_to NUMERIC NOT NULL
-);
+    valid_from INTEGER NOT NULL,
+    valid_to INTEGER NOT NULL
+);`
 
+	bodySchema = `
 create table dim_mime_types (
     id INTEGER PRIMARY KEY,
     mime_type TEXT NOT NULL
@@ -122,14 +181,25 @@ create table dim_mime_types (
 
 create table fact_bodies (
     action_id INTEGER references fact_action(id) NOT NULL,
-    path TEXT NOT NULL,
-    mime_id INTEGER references dim_mime_types(id) NOT NULL,
-    hash256 TEXT NOT NULL
-);
+    browser_mime_id INTEGER references dim_mime_types(id) NOT NULL,
+    determined_mime_id INTEGER references dim_mime_types(id) NOT NULL,
+    hash256 TEXT NOT NULL,
+    org_size INTEGER NOT NULL,
+    comp_size INTEGER,
+    path TEXT
+);`
 
-create table fact_console_output (
-    action_id INTEGER references fact_action(id),
-    seq INTEGER NOT NULL,
-    message TEXT NOT NULL
-);
-`
+	postDataSchema = `
+create table fact_post_data (
+    action_id INTEGER references fact_action(id) NOT NULL,
+    data TEXT NOT NULL
+);`
+
+	initiatorStackSchema = `
+create table fact_initiator_stack (
+    action_id INTEGER references fact_action(id) NOT NULL,
+    col INTEGER NOT NULL,
+    line INTEGER NOT NULL,
+    func TEXT
+);`
+)

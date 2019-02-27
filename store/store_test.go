@@ -1,545 +1,451 @@
 package store
 
 import (
-	"bytes"
+	"database/sql"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aau-network-security/kraaler"
+	_ "github.com/mattn/go-sqlite3"
+	cache "github.com/patrickmn/go-cache"
 )
 
-func TestFileStore(t *testing.T) {
-	lessThanOrg := func(sf StoredFile) error {
-		if sf.OrgSize <= sf.CompSize {
-			return fmt.Errorf("comp size (%d) is equal or larger than org size (%d)", sf.CompSize, sf.OrgSize)
-		}
-		return nil
+func TestIDStore(t *testing.T) {
+	type person struct {
+		name   string
+		age    int
+		height int
 	}
-
-	type checker func(StoredFile) error
 
 	tt := []struct {
 		name   string
-		files  []string
-		opts   []FileStoreOpt
-		checks []checker
-		amount int
+		cache  *cache.Cache
+		person person
 	}{
-		{name: "basic", files: []string{"meow"}, amount: 1},
-		{name: "deduplication", files: []string{"meow", "meow"}, amount: 1},
-		{name: "distinct", files: []string{"meow", "meow2"}, amount: 2},
-		{name: "compression",
-			opts:   []FileStoreOpt{WithCompression(GzipCompression)},
-			files:  []string{"meow meow meow"},
-			amount: 1,
-			checks: []checker{lessThanOrg},
-		},
-		{name: "conditional mime",
-			opts:   []FileStoreOpt{WithMimeTypes(func(s string) bool { return strings.HasPrefix(s, "text/html") })},
-			files:  []string{"meow", "<html></html>"},
-			amount: 1,
-		},
+		{name: "no cache", cache: nil, person: person{
+			name:   "Martin",
+			age:    18,
+			height: 182,
+		}},
+		{name: "with cache", cache: cache.New(time.Minute, time.Minute), person: person{
+			name:   "Martin",
+			age:    18,
+			height: 182,
+		}},
 	}
+
+	fname := func(t *testing.T) string {
+		tmpfile, err := ioutil.TempFile("", "id-store-test")
+		if err != nil {
+			t.Fatalf("unable to create temp file: %s", err)
+		}
+		f := tmpfile.Name()
+		os.Remove(f)
+
+		return f
+	}
+
+	initSql := `
+create table whatever_test (
+id INTEGER PRIMARY KEY,
+name TEXT NOT NULL,
+age INTEGER NOT NULL,
+height INTEGER NOT NULL
+)`
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
-			dir, err := ioutil.TempDir("", fmt.Sprintf("kraaler-filestore-test-%s", tc.name))
+			fn := fname(t)
+			db, err := sql.Open("sqlite3", fn)
 			if err != nil {
-				t.Fatalf("error when creating temp dir: %s", err)
+				t.Fatalf("unable to create database: %s", err)
 			}
-			defer os.RemoveAll(dir)
+			defer db.Close()
+			defer os.Remove(fn)
 
-			fs, err := NewFileStore(dir, tc.opts...)
+			if _, err := db.Exec(initSql); err != nil {
+				t.Fatalf("unable to initialize database: %s", err)
+			}
+
+			s := NewIDStore("whatever_test", tc.cache, "name", "age", "height")
+			tx, err := db.Begin()
 			if err != nil {
-				t.Fatalf("error when creating filestore: %s", err)
+				t.Fatalf("unable to begin transaction: %s", err)
 			}
+			defer tx.Rollback()
 
-			for _, txt := range tc.files {
-				sf, err := fs.Store([]byte(txt))
-				if err != nil {
-					if err == NotAllowedMimeErr {
-						continue
-					}
-
-					t.Fatalf("error when storing file (%s): %s", txt, err)
-				}
-
-				for _, c := range tc.checks {
-					if err := c(sf); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-
-			files, err := ioutil.ReadDir(dir)
+			id, err := s.Get(tx, tc.person.name, tc.person.age, tc.person.height)
 			if err != nil {
-				t.Fatalf("unable to read temp dir: %s", err)
+				t.Fatalf("unable to get id: %s", err)
 			}
 
-			if len(files) != tc.amount {
-				t.Fatalf("unexpected amount of files in store (expected: %d): %d", tc.amount, len(files))
+			if id == 0 {
+				t.Fatalf("expected id to be non-zero")
 			}
 
+			otherID, err := s.Get(tx, tc.person.name, tc.person.age, tc.person.height)
+			if err != nil {
+				t.Fatalf("unable to get id (again): %s", err)
+			}
+
+			if id != otherID {
+				t.Fatalf("expected id to be reused")
+			}
 		})
 	}
 }
 
-func TestScreenshotStore(t *testing.T) {
+func integerFieldsNonZero(tx *sql.Tx, table string, fields ...string) error {
+	query := fmt.Sprintf("select %s from %s", strings.Join(fields, ","), table)
+
+	ints := make([]interface{}, len(fields))
+	for i, _ := range ints {
+		var ii int
+		ints[i] = &ii
+	}
+
+	if err := tx.QueryRow(query).Scan(ints...); err != nil {
+		return err
+	}
+
+	for i, n := range ints {
+		p := n.(*int)
+		if *p == 0 {
+			return fmt.Errorf("field \"%s\" is 0 (zero)", fields[i])
+		}
+	}
+
+	return nil
+}
+
+func tableMustBeOfSize(tx *sql.Tx, table string, n int) error {
+	query := fmt.Sprintf("select count(*) from %s", table)
+
+	var count int
+	if err := tx.QueryRow(query).Scan(&count); err != nil {
+		return fmt.Errorf("unable to get count for %s: %s", table, err)
+	}
+
+	if count != n {
+		return fmt.Errorf("expected %s to be of size %d, but was %d", table, n, count)
+	}
+
+	return nil
+}
+
+func getDB(name string) (*sql.DB, string, error) {
+	tmpfile, err := ioutil.TempFile("", name)
+	if err != nil {
+		return nil, "", err
+	}
+	f := tmpfile.Name()
+	os.Remove(f)
+
+	db, err := sql.Open("sqlite3", f)
+	return db, f, err
+}
+
+func TestSessionStore(t *testing.T) {
 	tt := []struct {
-		name       string
-		domain     string
-		screenshot kraaler.BrowserScreenshot
+		name string
+		sess kraaler.CrawlSession
 	}{
-		{name: "basic", domain: "test.com", screenshot: kraaler.BrowserScreenshot{
-			Screenshot: []byte(`not_image_bytes`),
-			Resolution: kraaler.Resolution{800, 600},
-			Kind:       "png",
-			Taken:      time.Now(),
+		{name: "basic", sess: kraaler.CrawlSession{
+			InitialURL:     "http://aau.dk",
+			Resolution:     "800x600",
+			StartTime:      time.Now(),
+			LoadedTime:     time.Now(),
+			TerminatedTime: time.Now(),
 		}},
 	}
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
-			dir, err := ioutil.TempDir("", fmt.Sprintf("kraaler-screenshotstore-test-%s", tc.name))
+			db, path, err := getDB("session-store-test")
 			if err != nil {
-				t.Fatalf("error when creating temp dir: %s", err)
+				t.Fatalf("unable to create database: %s", err)
 			}
-			defer os.RemoveAll(dir)
+			defer os.Remove(path)
 
-			ss := NewScreenshotStore(dir)
-			if err := ss.Store(tc.screenshot, tc.domain); err != nil {
-				t.Fatalf("error when storing in screenshot store: %s", err)
-			}
-
-			folders, err := ioutil.ReadDir(dir)
+			ss, err := NewSessionStore(db)
 			if err != nil {
-				t.Fatalf("unable to read temp dir: %s", err)
+				t.Fatalf("unable to create session store: %s", err)
 			}
 
-			if len(folders) != 1 {
-				t.Fatalf("expected one folder to be created")
-			}
-
-			domainDir := filepath.Join(dir, folders[0].Name())
-			files, err := ioutil.ReadDir(domainDir)
+			tx, err := db.Begin()
 			if err != nil {
-				t.Fatalf("unable to read temp dir: %s", err)
+				t.Fatalf("unable to create transaction: %s", err)
+			}
+			defer tx.Rollback()
+
+			if _, err := ss.Save(tx, &tc.sess); err != nil {
+				t.Fatalf("unable to save session: %s", err)
 			}
 
-			if len(files) != 1 {
-				t.Fatalf("expected one file to be created")
+			if err := tableMustBeOfSize(tx, "fact_sessions", 1); err != nil {
+				t.Fatal(err)
 			}
 
-			file := files[0].Name()
-			if ext := "." + tc.screenshot.Kind; !strings.HasSuffix(file, ext) {
-				t.Fatalf("expected file (%s) to have extension: %s", file, ext)
+			if err := tableMustBeOfSize(tx, "dim_resolutions", 1); err != nil {
+				t.Fatal(err)
 			}
 
-			if res := tc.screenshot.Resolution.String(); !strings.Contains(file, res) {
-				t.Fatalf("expected file (%s) to contain resolution: %s", file, res)
-			}
-
-			content, err := ioutil.ReadFile(filepath.Join(domainDir, file))
-			if err != nil {
-				t.Fatalf("unable to read screenshot file: %s", err)
-			}
-
-			if bytes.Compare(content, tc.screenshot.Screenshot) != 0 {
-				t.Fatalf("expected file to be stored directly without modification")
+			if err := integerFieldsNonZero(tx, "fact_sessions",
+				"id",
+				"resolution_id",
+				"start_time",
+				"loaded_time",
+				"terminated_time",
+			); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
 }
 
-// func TestGetHostID(t *testing.T) {
-// 	type row struct {
-// 		domain string
-// 		tld    string
-// 		ip     string
-// 	}
-
-// 	tt := []struct {
-// 		name string
-// 		ip   string
-// 		url  string
-// 		row  row
-// 	}{
-// 		{name: "basic", ip: "8.8.8.8", url: "https://google.com/", row: row{"google.com", "com", "8.8.8.8"}},
-// 		{name: "subdomains", ip: "8.8.8.8", url: "https://mail.google.com/", row: row{"mail.google.com", "com", "8.8.8.8"}},
-// 	}
-
-// 	s, err := NewStore("get_host_id.db", "dummy-store")
-// 	if err != nil {
-// 		t.Fatal(err)
-// 	}
-// 	defer os.Remove("get_host_id.db")
-
-// 	for _, tc := range tt {
-// 		t.Run(tc.name, func(t *testing.T) {
-// 			getId := func() int64 {
-// 				tx, err := s.db.Begin()
-// 				if err != nil {
-// 					t.Fatalf("unexpected error when creating transaction: %s", err)
-// 				}
-
-// 				id, err := txStore{tx: tx}.getHostId(kraaler.BrowserAction{
-// 					HostIP: &tc.ip,
-// 					Request: kraaler.BrowserRequest{
-// 						URL: tc.url,
-// 					},
-// 				})
-
-// 				tx.Commit()
-
-// 				if err != nil {
-// 					t.Fatalf("unexpected error when retrieving host id: %s", err)
-// 				}
-
-// 				if id == 0 {
-// 					t.Fatalf("expected id to be greater than zero")
-// 				}
-
-// 				return id
-// 			}
-
-// 			id := getId()
-
-// 			var fetched row
-// 			err = s.db.QueryRow("select domain, tld, ipv4 from dim_hosts where domain = ? and tld = ? and ipv4 = ?",
-// 				tc.row.domain,
-// 				tc.row.tld,
-// 				tc.row.ip,
-// 			).Scan(
-// 				&fetched.domain,
-// 				&fetched.tld,
-// 				&fetched.ip,
-// 			)
-// 			if err != nil {
-// 				t.Fatalf("unable to fetch row from database: %s", err)
-// 			}
-
-// 			fv := fmt.Sprintf("%v", fetched)
-// 			ev := fmt.Sprintf("%v", tc.row)
-// 			if fv != ev {
-// 				t.Fatalf("unexpected row values:\n  expected -> %v\n  actual: -> %v\n",
-// 					ev,
-// 					fv,
-// 				)
-// 			}
-
-// 			if id != getId() {
-// 				t.Fatalf("expected id to be reused")
-// 			}
-
-// 		})
-// 	}
-
-// }
-
-// func TestGetSchemeId(t *testing.T) {
-// 	type row struct {
-// 		kind     string
-// 		protocol string
-// 	}
-
-// 	tt := []struct {
-// 		name     string
-// 		url      string
-// 		protocol string
-// 		row      row
-// 	}{
-// 		{name: "basic", protocol: "HTTP 2", url: "https://google.com/", row: row{"https", "HTTP 2"}},
-// 	}
-
-// 	s, err := NewStore("get_scheme_id.db", "dummy-store")
-// 	if err != nil {
-// 		t.Fatalf("unable to open database: %s", err)
-// 	}
-// 	defer os.Remove("get_scheme_id.db")
-
-// 	for _, tc := range tt {
-// 		t.Run(tc.name, func(t *testing.T) {
-// 			getId := func() int64 {
-// 				tx, err := s.db.Begin()
-// 				if err != nil {
-// 					t.Fatalf("unexpected error when creating transaction: %s", err)
-// 				}
-
-// 				id, err := txStore{tx: tx}.getSchemeId(kraaler.BrowserAction{
-// 					Protocol: &tc.protocol,
-// 					Request: kraaler.BrowserRequest{
-// 						URL: tc.url,
-// 					},
-// 				})
-
-// 				tx.Commit()
-
-// 				if err != nil {
-// 					t.Fatalf("unexpected error when retrieving host id: %s", err)
-// 				}
-
-// 				if id == 0 {
-// 					t.Fatalf("expected id to be greater than zero")
-// 				}
-
-// 				return id
-// 			}
-
-// 			id := getId()
-
-// 			var dummyId int64
-// 			err = s.db.QueryRow("select id from dim_schemes where scheme = ?",
-// 				tc.row.kind,
-// 			).Scan(&dummyId)
-// 			if err != nil && err != sql.ErrNoRows {
-// 				t.Fatalf("error fetching: %s", err)
-// 			}
-
-// 			if id != getId() {
-// 				t.Fatalf("expected id to be reused")
-// 			}
-
-// 		})
-// 	}
-
-// }
-
-// func TestGetInitiatorId(t *testing.T) {
-// 	type row struct {
-// 		name string
-// 	}
-
-// 	tt := []struct {
-// 		name      string
-// 		initiator string
-// 		row       row
-// 	}{
-// 		{name: "basic", initiator: "parser", row: row{"parser"}},
-// 	}
-
-// 	s, err := NewStore("get_initiator_id.db", "dummy-store")
-// 	if err != nil {
-// 		t.Fatalf("unable to open database: %s", err)
-// 	}
-// 	defer os.Remove("get_initiator_id.db")
-
-// 	for _, tc := range tt {
-// 		t.Run(tc.name, func(t *testing.T) {
-// 			getId := func() int64 {
-// 				tx, err := s.db.Begin()
-// 				if err != nil {
-// 					t.Fatalf("unexpected error when creating transaction: %s", err)
-// 				}
-
-// 				id, err := txStore{tx: tx}.getInitiatorId(kraaler.BrowserAction{
-// 					Initiator: tc.initiator,
-// 				})
-
-// 				tx.Commit()
-
-// 				if err != nil {
-// 					t.Fatalf("unexpected error when retrieving initiator id: %s", err)
-// 				}
-
-// 				if id == 0 {
-// 					t.Fatalf("expected id to be greater than zero")
-// 				}
-
-// 				return id
-// 			}
-
-// 			id := getId()
-
-// 			var dummyId int64
-// 			err = s.db.QueryRow("select id from dim_initiators where name = ?",
-// 				tc.row.name,
-// 			).Scan(&dummyId)
-// 			if err != nil && err != sql.ErrNoRows {
-// 				t.Fatalf("error fetching: %s", err)
-// 			}
-
-// 			if id != getId() {
-// 				t.Fatalf("expected id to be reused")
-// 			}
-
-// 		})
-// 	}
-
-// }
-
-// func TestGetErrorId(t *testing.T) {
-// 	type row struct {
-// 		error string
-// 	}
-
-// 	tt := []struct {
-// 		name  string
-// 		error string
-// 		row   row
-// 	}{
-// 		{name: "basic", error: "error is bad", row: row{"error is bad"}},
-// 	}
-
-// 	s, err := NewStore("get_error_id.db", "dummy-store")
-// 	if err != nil {
-// 		t.Fatalf("unable to open database: %s", err)
-// 	}
-// 	defer os.Remove("get_error_id.db")
-
-// 	for _, tc := range tt {
-// 		t.Run(tc.name, func(t *testing.T) {
-// 			getId := func() int64 {
-// 				tx, err := s.db.Begin()
-// 				if err != nil {
-// 					t.Fatalf("unexpected error when creating transaction: %s", err)
-// 				}
-
-// 				id, err := txStore{tx: tx}.getErrorId(kraaler.BrowserAction{
-// 					ResponseError: &tc.error,
-// 				})
-
-// 				tx.Commit()
-
-// 				if err != nil {
-// 					t.Fatalf("unexpected error when retrieving host id: %s", err)
-// 				}
-
-// 				if id == 0 {
-// 					t.Fatalf("expected id to be greater than zero")
-// 				}
-
-// 				return id
-// 			}
-
-// 			id := getId()
-
-// 			var dummyId int64
-// 			err = s.db.QueryRow("select id from dim_errors where error = ?",
-// 				tc.row.error,
-// 			).Scan(&dummyId)
-// 			if err != nil && err != sql.ErrNoRows {
-// 				t.Fatalf("error fetching: %s", err)
-// 			}
-
-// 			if id != getId() {
-// 				t.Fatalf("expected id to be reused")
-// 			}
-
-// 		})
-// 	}
-
-// }
-
-// func TestGetKeyValueId(t *testing.T) {
-// 	s, err := NewStore("get_keyv_id.db", "dummy-store")
-// 	if err != nil {
-// 		t.Fatalf("unable to open database: %s", err)
-// 	}
-// 	defer os.Remove("get_keyv_id.db")
-
-// 	getId := func() int64 {
-// 		tx, err := s.db.Begin()
-// 		if err != nil {
-// 			t.Fatalf("unexpected error when creating transaction: %s", err)
-// 		}
-
-// 		id, err := txStore{tx: tx}.getKeyvalueId("keytest", "valuetest")
-
-// 		tx.Commit()
-
-// 		if err != nil {
-// 			t.Fatalf("unexpected error when retrieving keyvalue id: %s", err)
-// 		}
-
-// 		if id == 0 {
-// 			t.Fatalf("expected id to be greater than zero")
-// 		}
-
-// 		return id
-// 	}
-
-// 	id := getId()
-
-// 	var count int64
-// 	err = s.db.QueryRow("select count(*) from dim_header_keyvalues").Scan(&count)
-// 	if err != nil && err != sql.ErrNoRows {
-// 		t.Fatalf("error fetching: %s", err)
-// 	}
-
-// 	if count <= 0 {
-// 		t.Fatalf("expected atleast one column in dim_header_keyvalues")
-// 	}
-
-// 	err = s.db.QueryRow("select count(*) from dim_header_keys").Scan(&count)
-// 	if err != nil && err != sql.ErrNoRows {
-// 		t.Fatalf("error fetching: %s", err)
-// 	}
-
-// 	if count <= 0 {
-// 		t.Fatalf("expected atleast one column dim_header_keys")
-// 	}
-
-// 	if id != getId() {
-// 		t.Fatalf("expected id to be reused")
-// 	}
-
-// }
-
-// func TestStoreSave(t *testing.T) {
-// 	s, err := NewStore("save_test.db", "dummy-store")
-// 	if err != nil {
-// 		t.Fatalf("unable to open database: %s", err)
-// 	}
-
-// 	tx, err := s.db.Begin()
-// 	if err != nil {
-// 		t.Fatalf("unexpected error when creating transaction: %s", err)
-// 	}
-
-// 	proto := "HTTP 1.1"
-// 	hostip := "1.1.1.1"
-// 	action := kraaler.BrowserAction{
-// 		Initiator: "parser",
-// 		Protocol:  &proto,
-// 		Request: kraaler.BrowserRequest{
-// 			URL:    "https://google.com/",
-// 			Method: "GET",
-// 			Headers: map[string]string{
-// 				"Dummy-Header": "Testing",
-// 			},
-// 		},
-// 		Response: &kraaler.BrowserResponse{
-// 			StatusCode: http.StatusOK,
-// 			Headers: map[string]string{
-// 				"Dummy-Reply": "Testing2",
-// 			},
-// 			MimeType:           "text/html",
-// 			Body:               []byte("meow"),
-// 			BodyChecksumSha256: "asbcsast",
-// 		},
-// 		HostIP: &hostip,
-// 		SecurityDetails: &kraaler.BrowserSecurityDetails{
-// 			Protocol:    "TLS 1.2",
-// 			KeyExchange: "RSA",
-// 			Cipher:      "No idea",
-// 			SubjectName: "google.com",
-// 			SanList:     []string{"aaa", "bbb", "ccc"},
-// 			Issuer:      "Google",
-// 			ValidFrom:   time.Now(),
-// 			ValidTo:     time.Now().Add(24 * time.Hour),
-// 		},
-// 		Console: []string{"test1", "test2"},
-// 	}
-
-// 	err = s.Save(action)
-// 	if err != nil {
-// 		t.Fatal(err)
-// 	}
-
-// 	tx.Commit()
-// }
+func TestConsoleStore(t *testing.T) {
+	tt := []struct {
+		name    string
+		console []string
+	}{
+		{name: "basic", console: []string{"debug", "test"}},
+	}
+
+	table := "fact_console_output"
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			db, path, err := getDB("console-store-test")
+			if err != nil {
+				t.Fatalf("unable to create database: %s", err)
+			}
+			defer os.Remove(path)
+
+			cs, err := NewConsoleStore(db)
+			if err != nil {
+				t.Fatalf("unable to create console store: %s", err)
+			}
+
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatalf("unable to create transaction: %s", err)
+			}
+			defer tx.Rollback()
+
+			if err := cs.Save(tx, 1, tc.console); err != nil {
+				t.Fatalf("unable to save console: %s", err)
+			}
+
+			if err := tableMustBeOfSize(tx, table, len(tc.console)); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := integerFieldsNonZero(tx, table,
+				"session_id",
+				"seq",
+			); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestScreenStore(t *testing.T) {
+	tt := []struct {
+		name       string
+		url        string
+		screenshot kraaler.BrowserScreenshot
+	}{
+		{name: "basic", url: "http://aau.dk", screenshot: kraaler.BrowserScreenshot{
+			Screenshot: []byte("a"),
+			Kind:       "png",
+			Taken:      time.Now(),
+		}},
+	}
+
+	table := "fact_screenshots"
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			db, path, err := getDB("screen-store-test")
+			if err != nil {
+				t.Fatalf("unable to create database: %s", err)
+			}
+			defer os.Remove(path)
+
+			dir, err := ioutil.TempDir("", fmt.Sprintf("screen-store-screenshotstore-test-%s", tc.name))
+			if err != nil {
+				t.Fatalf("error when creating temp dir: %s", err)
+			}
+			defer os.RemoveAll(dir)
+
+			ss, err := NewScreenStore(db, NewScreenshotStore(dir))
+			if err != nil {
+				t.Fatalf("unable to create screen store: %s", err)
+			}
+
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatalf("unable to create transaction: %s", err)
+			}
+			defer tx.Rollback()
+
+			if err := ss.Save(tx, 1, tc.url, []*kraaler.BrowserScreenshot{&tc.screenshot}); err != nil {
+				t.Fatalf("unable to save: %s", err)
+			}
+
+			if err := tableMustBeOfSize(tx, table, 1); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := integerFieldsNonZero(tx, table,
+				"session_id",
+				"time_taken",
+			); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestActionStore(t *testing.T) {
+	tt := []struct {
+		name      string
+		action    kraaler.CrawlAction
+		tableDiff map[string]int
+	}{
+		{
+			name: "basic",
+			action: kraaler.CrawlAction{
+				Initiator: kraaler.Initiator{
+					Kind: "script",
+					Stack: &kraaler.CallFrame{
+						Column:     2,
+						LineNumber: 25,
+						Function:   func(s string) *string { return &s }("some_func"),
+					},
+				},
+				Protocol: func(s string) *string { return &s }("http 1/1"),
+				HostIP:   func(s string) *string { return &s }("192.168.1.1"),
+				SecurityDetails: &kraaler.BrowserSecurityDetails{
+					Protocol:    "RSA",
+					KeyExchange: "TEX",
+					Cipher:      "TUX",
+					SubjectName: "aau.dk",
+					Issuer:      "Comodo",
+					ValidFrom:   time.Now(),
+					ValidTo:     time.Now(),
+				},
+				Request: kraaler.BrowserRequest{
+					URL:    "http://aau.dk",
+					Method: "GET",
+					Headers: map[string]string{
+						"User-Agent": "Chrome",
+						"Date":       "Today",
+					},
+					PostData: func(s string) *string { return &s }("some_post"),
+				},
+				Response: &kraaler.BrowserResponse{
+					StatusCode: http.StatusOK,
+					Headers: map[string]string{
+						"Server": "nginx",
+					},
+					MimeType: "text/plain",
+					Body:     []byte("hello world"),
+				},
+			},
+			tableDiff: map[string]int{
+				"dim_methods":    1,
+				"dim_hosts":      1,
+				"dim_protocols":  2,
+				"dim_initiators": 1,
+				"fact_actions":   1,
+
+				"dim_header_keyvalues":  3,
+				"fact_response_headers": 1,
+				"fact_request_headers":  2,
+
+				"dim_url_schemes":     1,
+				"dim_url_users":       0,
+				"dim_url_hosts":       1,
+				"dim_url_paths":       1,
+				"dim_url_fragments":   0,
+				"dim_url_raw_queries": 0,
+				"fact_urls":           1,
+
+				"dim_mime_types": 1,
+				"fact_bodies":    1,
+
+				"fact_post_data":       1,
+				"fact_initiator_stack": 1,
+
+				"dim_issuers":           1,
+				"dim_key_exchanges":     1,
+				"dim_ciphers":           1,
+				"dim_san_lists":         1,
+				"fact_security_details": 1,
+			},
+		},
+	}
+
+	table := "fact_actions"
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			db, path, err := getDB("action-store-test")
+			if err != nil {
+				t.Fatalf("unable to create database: %s", err)
+			}
+			defer os.Remove(path)
+
+			dir, err := ioutil.TempDir("", fmt.Sprintf("action-store-test-%s", tc.name))
+			if err != nil {
+				t.Fatalf("error when creating temp dir: %s", err)
+			}
+			defer os.RemoveAll(dir)
+
+			fs, err := NewFileStore(dir, WithCompression(GzipCompression))
+			if err != nil {
+				t.Fatalf("unable to create file store: %s", err)
+			}
+
+			as, err := NewActionStore(db, fs)
+			if err != nil {
+				t.Fatalf("unable to create action store: %s", err)
+			}
+
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatalf("unable to create transaction: %s", err)
+			}
+			defer tx.Rollback()
+
+			if err := as.Save(tx, 1, []*kraaler.CrawlAction{&tc.action}); err != nil {
+				t.Fatalf("unable to save: %s", err)
+			}
+
+			if err := tableMustBeOfSize(tx, table, 1); err != nil {
+				t.Fatal(err)
+			}
+
+			for table, diff := range tc.tableDiff {
+				if err := tableMustBeOfSize(tx, table, diff); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := integerFieldsNonZero(tx, table,
+				"session_id",
+				"method_id",
+				"protocol_id",
+				"host_id",
+				"initiator_id",
+				"status_code",
+			); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
