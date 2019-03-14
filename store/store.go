@@ -3,55 +3,107 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"net"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/aau-network-security/kraaler"
+	"github.com/mafredri/cdp/protocol/network"
 	_ "github.com/mattn/go-sqlite3"
 	cache "github.com/patrickmn/go-cache"
+	"golang.org/x/net/publicsuffix"
 )
 
 type sessStoreFunc func(*sql.Tx, *kraaler.CrawlSession) (interface{}, error)
 type actionStoreFunc func(*sql.Tx, *kraaler.CrawlAction) (interface{}, error)
 
 type Store struct {
-	db          *sql.DB
-	path        string
-	screenStore *ScreenshotStore
-	sessStore   *SessionStore
-	acStore     *ActionStore
+	db      *sql.DB
+	session *SessionStore
+	action  *ActionStore
+	console *ConsoleStore
+	screen  *ScreenStore
 }
 
-func NewStore(dbpath string, path string) (*SessionStore, error) {
-	// var performInit bool
-	// if _, err := os.Stat(dbpath); os.IsNotExist(err) {
-	// 	performInit = true
-	// }
+func NewStore(db *sql.DB, bodyPath, screenPath string) (*Store, error) {
+	ss, err := NewSessionStore(db)
+	if err != nil {
+		return nil, err
+	}
 
-	// db, err := sql.Open("sqlite3", dbpath)
-	// if err != nil {
-	// 	return nil, err
-	// }
+	bodyS, err := NewFileStore(bodyPath,
+		WithCompression(GzipCompression),
+		WithMimeTypes(func(s string) bool { return strings.HasPrefix(s, "text/") }))
 
-	// if performInit {
-	// 	if _, err := db.Exec(initSql); err != nil {
-	// 		return nil, err
-	// 	}
-	// }
+	if err != nil {
+		return nil, err
+	}
 
-	// return &SessionStore{
-	// 	db:            db,
-	// 	path:          path,
-	// 	dimResolution: NewIDStore("dim_resolutions", cache.New(15*time.Minute, 15*time.Minute), "resolution"),
-	// 	dimMethod:     NewIDStore("dim_methods", cache.New(15*time.Minute, 15*time.Minute), "method"),
-	// 	dimProto:      NewIDStore("dim_protocols", cache.New(15*time.Minute, 15*time.Minute), "protocol"),
-	// 	dimHosts:      NewIDStore("dim_hosts", cache.New(time.Minute, 10*time.Minute), "domain", "tld", "ipv4"),
-	// 	dimInitiators: NewIDStore("dim_initiators", cache.New(15*time.Minute, 15*time.Minute), "initiator"),
-	// 	dimErrors:     NewIDStore("dim_errors", nil, "error"),
-	// }, nil
+	as, err := NewActionStore(db, bodyS)
+	if err != nil {
+		return nil, err
+	}
 
-	return nil, nil
+	cs, err := NewConsoleStore(db)
+	if err != nil {
+		return nil, err
+	}
+
+	scs, err := NewScreenStore(db, NewScreenshotStore(screenPath))
+	if err != nil {
+		return nil, err
+	}
+
+	return &Store{
+		db:      db,
+		session: ss,
+		action:  as,
+		console: cs,
+		screen:  scs,
+	}, nil
+}
+
+func (s *Store) SaveSession(cs kraaler.CrawlSession) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	id, err := s.session.Save(tx, &cs)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	err = s.action.Save(tx, id, cs.Actions)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	err = s.console.Save(tx, id, cs.Console)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	dom, err := publicsuffix.EffectiveTLDPlusOne(cs.InitialURL.Host)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	err = s.screen.Save(tx, id, dom, cs.Screenshots)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	tx.Commit()
+
+	return nil
 }
 
 type SessionStore struct {
@@ -80,8 +132,8 @@ func (ss *SessionStore) Save(tx *sql.Tx, sess *kraaler.CrawlSession) (int64, err
 
 			return id, nil
 		},
-		"start_time": func(tx *sql.Tx) (interface{}, error) {
-			return sess.StartTime.Unix(), nil
+		"navigated_time": func(tx *sql.Tx) (interface{}, error) {
+			return sess.NavigateTime.Unix(), nil
 		},
 		"loaded_time": func(tx *sql.Tx) (interface{}, error) {
 			return sess.LoadedTime.Unix(), nil
@@ -93,7 +145,11 @@ func (ss *SessionStore) Save(tx *sql.Tx, sess *kraaler.CrawlSession) (int64, err
 			return len(sess.Actions), nil
 		},
 		"error": func(tx *sql.Tx) (interface{}, error) {
-			return sess.Error, nil
+			if sess.Error == nil {
+				return nil, nil
+			}
+
+			return sess.Error.Error(), nil
 		},
 	}
 
@@ -105,7 +161,10 @@ func (ss *SessionStore) Save(tx *sql.Tx, sess *kraaler.CrawlSession) (int64, err
 	return id, nil
 }
 
-type ConsoleStore struct{}
+type ConsoleStore struct {
+	dimMessages         *IDStore
+	dimJavaScriptOrigin *IDStore
+}
 
 func NewConsoleStore(db *sql.DB) (*ConsoleStore, error) {
 	if db != nil {
@@ -114,13 +173,26 @@ func NewConsoleStore(db *sql.DB) (*ConsoleStore, error) {
 		}
 	}
 
-	return &ConsoleStore{}, nil
+	return &ConsoleStore{
+		dimMessages:         NewIDStore("dim_console_messages", cache.New(10*time.Minute, 2*time.Minute), "message"),
+		dimJavaScriptOrigin: NewIDStore("dim_javascript_origin", nil, "func", "column", "line"),
+	}, nil
 }
 
-func (cs *ConsoleStore) Save(tx *sql.Tx, id int64, console []string) error {
-	cins := inserter{tx, GetInsertQuery("fact_console_output", "session_id", "seq", "message"), true}
-	for i, msg := range console {
-		if _, err := cins.Insert(id, i+1, msg); err != nil {
+func (cs *ConsoleStore) Save(tx *sql.Tx, id int64, console []*kraaler.JavaScriptConsole) error {
+	cins := inserter{tx, GetInsertQuery("fact_console_output", "session_id", "seq", "javascript_origin_id", "msg_id"), true}
+	for i, c := range console {
+		jid, err := cs.dimJavaScriptOrigin.Get(tx, c.Function, c.Column, c.Line)
+		if err != nil {
+			return err
+		}
+
+		mid, err := cs.dimMessages.Get(tx, c.Msg)
+		if err != nil {
+			return err
+		}
+
+		if _, err := cins.Insert(id, i+1, jid, mid); err != nil {
 			return err
 		}
 	}
@@ -144,13 +216,8 @@ func NewScreenStore(db *sql.DB, ss *ScreenshotStore) (*ScreenStore, error) {
 
 func (ss *ScreenStore) Save(tx *sql.Tx, id int64, urlstr string, screenshots []*kraaler.BrowserScreenshot) error {
 	sins := inserter{tx, GetInsertQuery("fact_screenshots", "session_id", "time_taken", "path"), true}
-	u, err := url.Parse(urlstr)
-	if err != nil {
-		return err
-	}
-
 	for _, screen := range screenshots {
-		path, err := ss.ssStore.Store(screen, u.Host)
+		path, err := ss.ssStore.Store(screen, urlstr)
 		if err != nil {
 			return err
 		}
@@ -223,7 +290,7 @@ func NewActionStore(db *sql.DB, fs *FileStore) (*ActionStore, error) {
 
 		dimMethod:     NewIDStore("dim_methods", cache.New(15*time.Minute, 15*time.Minute), "method"),
 		dimProto:      NewIDStore("dim_protocols", cache.New(15*time.Minute, 15*time.Minute), "protocol"),
-		dimHosts:      NewIDStore("dim_hosts", cache.New(time.Minute, 10*time.Minute), "domain", "tld", "ipv4"),
+		dimHosts:      NewIDStore("dim_hosts", cache.New(time.Minute, 10*time.Minute), "domain", "tld", "ipv4", "nameservers"),
 		dimInitiators: NewIDStore("dim_initiators", cache.New(15*time.Minute, 15*time.Minute), "initiator"),
 		dimErrors:     NewIDStore("dim_errors", nil, "error"),
 	}, nil
@@ -244,7 +311,15 @@ func (as *ActionStore) Save(tx *sql.Tx, id int64, actions []*kraaler.CrawlAction
 			return id, nil
 		},
 		"protocol_id": func(tx *sql.Tx, a *kraaler.CrawlAction) (interface{}, error) {
-			id, err := as.dimProto.Get(tx, a.Protocol)
+			if resp := a.Response; resp == nil {
+				return nil, nil
+			}
+
+			if proto := a.Response.Protocol; proto == nil {
+				return nil, nil
+			}
+
+			id, err := as.dimProto.Get(tx, a.Response.Protocol)
 			if err != nil {
 				return nil, err
 			}
@@ -252,18 +327,24 @@ func (as *ActionStore) Save(tx *sql.Tx, id int64, actions []*kraaler.CrawlAction
 			return id, nil
 		},
 		"host_id": func(tx *sql.Tx, a *kraaler.CrawlAction) (interface{}, error) {
-			u, err := url.Parse(a.Request.URL)
+			if strings.HasPrefix(a.Request.URL, "data:") {
+				return nil, nil
+			}
+
+			dom := string(a.Host.Domain)
+			if net.ParseIP(dom) != nil {
+				return nil, nil
+			}
+
+			rootDom, err := publicsuffix.EffectiveTLDPlusOne(dom)
 			if err != nil {
-				return nil, err
+				return nil, nil
 			}
 
-			parts := strings.Split(u.Host, ".")
-			if len(parts) < 2 {
-				return nil, fmt.Errorf("malformed domain")
-			}
-			tld := parts[len(parts)-1]
+			tld, _ := publicsuffix.PublicSuffix(rootDom)
+			sort.Strings(a.Host.NameServers)
 
-			id, err := as.dimHosts.Get(tx, u.Host, tld, a.HostIP)
+			id, err := as.dimHosts.Get(tx, rootDom, tld, a.Host.IPAddr, strings.Join(a.Host.NameServers, ","))
 			if err != nil {
 				return nil, err
 			}
@@ -279,11 +360,11 @@ func (as *ActionStore) Save(tx *sql.Tx, id int64, actions []*kraaler.CrawlAction
 			return id, nil
 		},
 		"error_id": func(tx *sql.Tx, a *kraaler.CrawlAction) (interface{}, error) {
-			if a.ResponseError == nil {
+			if a.Error == nil {
 				return nil, nil
 			}
 
-			id, err := as.dimErrors.Get(tx, a.ResponseError)
+			id, err := as.dimErrors.Get(tx, a.Error)
 			if err != nil {
 				return nil, err
 			}
@@ -299,7 +380,7 @@ func (as *ActionStore) Save(tx *sql.Tx, id int64, actions []*kraaler.CrawlAction
 		},
 		"status_code": func(tx *sql.Tx, a *kraaler.CrawlAction) (interface{}, error) {
 			if a.Response != nil {
-				return a.Response.StatusCode, nil
+				return a.Response.Status, nil
 			}
 
 			return nil, nil
@@ -336,27 +417,38 @@ func (as *ActionStore) Save(tx *sql.Tx, id int64, actions []*kraaler.CrawlAction
 			return err
 		}
 
-		for k, v := range a.Request.Headers {
+		reqHeaders, err := a.Request.Headers.Map()
+		if err != nil {
+			return err
+		}
+		for k, v := range reqHeaders {
 			if err := as.headerStore.SaveRequest(tx, id, k, v); err != nil {
 				return err
 			}
 		}
 
-		if a.SecurityDetails != nil {
-			if err := as.securityStore.Save(tx, id, *a.SecurityDetails); err != nil {
+		if resp := a.Response; resp != nil {
+			respHeaders, err := resp.Headers.Map()
+			if err != nil {
 				return err
 			}
-		}
 
-		if a.Response != nil {
-			for k, v := range a.Response.Headers {
+			for k, v := range respHeaders {
 				if err := as.headerStore.SaveResponse(tx, id, k, v); err != nil {
 					return err
 				}
 			}
 
-			if err := as.bodyStore.Save(tx, id, *a.Response); err != nil {
-				return err
+			if resp.SecurityDetails != nil {
+				if err := as.securityStore.Save(tx, id, resp.SecurityDetails); err != nil {
+					return err
+				}
+			}
+
+			if a.Body != nil {
+				if err := as.bodyStore.Save(tx, id, *a.Body, resp.MimeType); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -545,7 +637,7 @@ func NewSecurityStore(db *sql.DB) (*SecurityStore, error) {
 	}, nil
 }
 
-func (ss *SecurityStore) Save(tx *sql.Tx, id int64, sd kraaler.BrowserSecurityDetails) error {
+func (ss *SecurityStore) Save(tx *sql.Tx, id int64, sd *network.SecurityDetails) error {
 	get := func(s *IDStore, i interface{}) func(tx *sql.Tx) (interface{}, error) {
 		return func(tx *sql.Tx) (interface{}, error) {
 			id, err := s.Get(tx, i)
@@ -568,10 +660,10 @@ func (ss *SecurityStore) Save(tx *sql.Tx, id int64, sd kraaler.BrowserSecurityDe
 			return sd.SubjectName, nil
 		},
 		"valid_from": func(tx *sql.Tx) (interface{}, error) {
-			return sd.ValidFrom.Unix(), nil
+			return sd.ValidFrom, nil
 		},
 		"valid_to": func(tx *sql.Tx) (interface{}, error) {
-			return sd.ValidTo.Unix(), nil
+			return sd.ValidTo, nil
 		},
 	}
 
@@ -600,7 +692,7 @@ func NewBodyStore(db *sql.DB, fs *FileStore) (*BodyStore, error) {
 	}, nil
 }
 
-func (ss *BodyStore) Save(tx *sql.Tx, id int64, resp kraaler.BrowserResponse) error {
+func (ss *BodyStore) Save(tx *sql.Tx, id int64, body kraaler.ResponseBody, mime string) error {
 	get := func(s *IDStore, i interface{}) func(tx *sql.Tx) (interface{}, error) {
 		return func(tx *sql.Tx) (interface{}, error) {
 			id, err := s.Get(tx, i)
@@ -611,7 +703,7 @@ func (ss *BodyStore) Save(tx *sql.Tx, id int64, resp kraaler.BrowserResponse) er
 		}
 	}
 
-	sf, err := ss.fs.Store(resp.Body)
+	sf, err := ss.fs.Store(body.Body)
 	if err != nil && err != NotAllowedMimeErr {
 		return err
 	}
@@ -620,10 +712,8 @@ func (ss *BodyStore) Save(tx *sql.Tx, id int64, resp kraaler.BrowserResponse) er
 		"action_id": func(tx *sql.Tx) (interface{}, error) {
 			return id, nil
 		},
-		"browser_mime_id": get(ss.dimMime, resp.MimeType),
-		"determined_mime_id": func(tx *sql.Tx) (interface{}, error) {
-			return sf.MimeType, nil
-		},
+		"browser_mime_id":    get(ss.dimMime, mime),
+		"determined_mime_id": get(ss.dimMime, sf.MimeType),
 		"path": func(tx *sql.Tx) (interface{}, error) {
 			if sf.Path == "" {
 				return nil, nil

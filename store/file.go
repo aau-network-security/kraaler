@@ -214,6 +214,10 @@ func NewScreenshotStore(dir string) *ScreenshotStore {
 }
 
 func (ss *ScreenshotStore) Store(s *kraaler.BrowserScreenshot, domain string) (string, error) {
+	if s == nil {
+		return "", fmt.Errorf("screenshot cannot be nil")
+	}
+
 	filename := fmt.Sprintf(
 		"%s-%s.%s",
 		randStringOfLen(16),
@@ -243,5 +247,5 @@ func (ss *ScreenshotStore) Store(s *kraaler.BrowserScreenshot, domain string) (s
 		return "", err
 	}
 
-	return filename, nil
+	return path, nil
 }

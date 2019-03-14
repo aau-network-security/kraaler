@@ -1,20 +1,30 @@
 package kraaler
 
 import (
+	"context"
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/base64"
 	"errors"
 	"fmt"
-	"log"
 	"net"
-	"sort"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	docker "github.com/fsouza/go-dockerclient"
+	ui "github.com/gizak/termui"
+	"github.com/gizak/termui/widgets"
 	"github.com/google/uuid"
+	"github.com/mafredri/cdp"
+	"github.com/mafredri/cdp/devtool"
+	"github.com/mafredri/cdp/protocol/network"
+	"github.com/mafredri/cdp/protocol/page"
+	"github.com/mafredri/cdp/protocol/target"
+	"github.com/mafredri/cdp/rpcc"
+	"github.com/mafredri/cdp/session"
+	"github.com/patrickmn/go-cache"
 	"github.com/raff/godet"
 )
 
@@ -22,11 +32,15 @@ const (
 	CHROME_REQ_WILL_BE_SENT = "Network.requestWillBeSent"
 	CHROME_RESP_RECEIVED    = "Network.responseReceived"
 	CHROME_LOADING_FAILED   = "Network.loadingFailed"
+	CHROME_LOADING_FINISHED = "Network.loadingFinished"
 	CUSTOM_GOT_BODY         = "Custom.body"
 )
 
 var (
-	FuncTimeoutErr = errors.New("timeout")
+	ErrFuncTimeout = errors.New("timeout")
+	ErrNameServer  = errors.New("unable to get name servers")
+	ErrDockerConn  = errors.New("docker connection not responding")
+	ErrTimeoutDOM  = errors.New("timeout loading document object model")
 )
 
 var DefaultResolution = &Resolution{
@@ -46,10 +60,14 @@ func (note *NotOfTypeErr) Error() string {
 
 type Worker struct {
 	id        string
-	port      uint
 	container *docker.Container
-	rdb       *godet.RemoteDebugger
+	endpoint  string
 	kill      chan struct{}
+	hostInfo  *cache.Cache
+
+	rpccConn       *rpcc.Conn
+	cdpClient      *cdp.Client
+	sessionManager *session.Manager
 
 	conf WorkerConfig
 }
@@ -89,31 +107,19 @@ func NewWorker(conf WorkerConfig) (*Worker, error) {
 
 	id := uuid.New().String()[0:8]
 	w := &Worker{
-		id:   id,
-		conf: conf,
+		id:       id,
+		conf:     conf,
+		hostInfo: cache.New(2*time.Minute, 30*time.Second),
 	}
 
-	endpoint := conf.UseInstance
-	if conf.UseInstance == "" {
+	w.endpoint = conf.UseInstance
+	if w.endpoint == "" {
 		c, err := w.createContainer()
 		if err != nil {
 			return nil, err
 		}
 		w.container = c
-
-		endpoint = fmt.Sprintf("localhost:%d", w.port)
 	}
-
-	WaitForInstance(endpoint, 2*time.Minute)
-
-	rdb, err := godet.Connect(endpoint, false)
-	if err != nil {
-		return nil, err
-	}
-	if err := rdb.SetCacheDisabled(true); err != nil {
-		return nil, err
-	}
-	w.rdb = rdb
 
 	go w.listen(conf.Queue, conf.Responses)
 
@@ -121,7 +127,41 @@ func NewWorker(conf WorkerConfig) (*Worker, error) {
 }
 
 func (w *Worker) listen(queue <-chan CrawlRequest, results chan<- CrawlSession) {
+	errCheck := func(errs ...error) func(error) bool {
+		return func(err error) bool {
+			for _, e := range errs {
+				if err == e {
+					return true
+				}
+			}
+			return false
+		}
+	}
 	w.kill = make(chan struct{})
+	fetch := func(req CrawlRequest) CrawlSession {
+		resetErrs := errCheck(context.DeadlineExceeded, ErrDockerConn)
+
+		for {
+			timeout := 20 * time.Second
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			resp := w.fetch(ctx, req)
+			cancel()
+
+			if err := resp.Error; resetErrs(err) {
+				w.removeContainer(w.container)
+				var err error
+
+				w.container, err = w.createContainer()
+				for err != nil {
+					w.container, err = w.createContainer()
+				}
+
+				continue
+			}
+
+			return resp
+		}
+	}
 
 	for {
 		select {
@@ -129,17 +169,34 @@ func (w *Worker) listen(queue <-chan CrawlRequest, results chan<- CrawlSession) 
 			return
 
 		case req := <-queue:
-			resp := w.fetch(req)
+			resp := fetch(req)
+			// if err := resp.Error; err != nil {
+			// 	if err != ErrTimeoutDOM && err != context.DeadlineExceeded && err != rpcc.ErrConnClosing && strings.HasPrefix(err.Error(), "net::") == false {
+			// 		fmt.Printf("error: %T %s\n", resp.Error, resp.Error)
+			// 		return
+			// 	}
+			// }
 			results <- resp
+
 		}
 	}
 }
 
-func (w *Worker) createContainer() (*docker.Container, error) {
-	if w.port == 0 {
-		port := GetAvailablePort()
-		w.port = port
+func (w *Worker) getHostInfo(domain string) Host {
+	if h, ok := w.hostInfo.Get(domain); ok {
+		if host, ok := h.(Host); ok {
+			return host
+		}
 	}
+
+	host, _ := GetHostInfo(Domain(domain))
+	w.hostInfo.Set(domain, host, cache.DefaultExpiration)
+	return host
+}
+
+func (w *Worker) createContainer() (*docker.Container, error) {
+	port := GetAvailablePort()
+	w.endpoint = fmt.Sprintf("http://127.0.0.1:%d", port)
 
 	img := "chromedp/headless-shell"
 	opts := docker.CreateContainerOptions{
@@ -151,11 +208,14 @@ func (w *Worker) createContainer() (*docker.Container, error) {
 		HostConfig: &docker.HostConfig{
 			MemorySwap:       0,
 			MemorySwappiness: 0,
-			Memory:           756 * 1024 * 1024,
+			Memory:           768 * 1024 * 1024,
+			CPUPeriod:        100000,
+			CPUQuota:         100000, // one core
+			DNS:              []string{"1.1.1.1"},
 			PortBindings: map[docker.Port][]docker.PortBinding{
 				docker.Port("9222/tcp"): {{
 					HostIP:   "127.0.0.1",
-					HostPort: fmt.Sprintf("%d", w.port),
+					HostPort: fmt.Sprintf("%d", port),
 				}},
 			},
 		},
@@ -177,12 +237,39 @@ func (w *Worker) createContainer() (*docker.Container, error) {
 		}
 	}
 
-	if err := w.conf.DockerClient.StartContainer(c.ID, nil); err != nil {
-		w.conf.DockerClient.RemoveContainer(docker.RemoveContainerOptions{ID: c.ID})
+	stop := func(err error) (*docker.Container, error) {
+		w.removeContainer(c)
 		return nil, err
 	}
 
+	if err := w.conf.DockerClient.StartContainer(c.ID, nil); err != nil {
+		return stop(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := WaitForEndpoint(ctx, w.endpoint); err != nil {
+		return stop(err)
+	}
+
 	return c, nil
+}
+
+func (w *Worker) removeContainer(c *docker.Container) error {
+	if c == nil {
+		return nil
+	}
+
+	w.conf.DockerClient.StopContainer(
+		c.ID,
+		1,
+	)
+
+	return w.conf.DockerClient.RemoveContainer(
+		docker.RemoveContainerOptions{
+			ID: c.ID,
+		},
+	)
 }
 
 type ChromeEventParam struct {
@@ -190,15 +277,99 @@ type ChromeEventParam struct {
 	params map[string]interface{}
 }
 
-func (w *Worker) fetch(req CrawlRequest) CrawlSession {
-	stop := make(chan time.Time)
+type Causer interface {
+	Cause() error
+}
 
-	w.rdb.CallbackEvent("Page.frameStoppedLoading", func(params godet.Params) {
-		stop <- time.Now()
-	})
+func (w *Worker) Client(ctx context.Context) (*cdp.Client, func() error, error) {
+	handleErr := func(err error) (*cdp.Client, func() error, error) {
+		if strings.HasSuffix(err.Error(), "rpcc: the connection is closing") {
+			w.rpccConn.Close()
+			w.rpccConn = nil
 
+			w.cdpClient = nil
+
+			w.sessionManager.Close()
+			w.sessionManager = nil
+
+			return nil, nil, rpcc.ErrConnClosing
+		}
+
+		return nil, nil, err
+	}
+
+	if w.rpccConn == nil {
+		bver, err := devtool.New(w.endpoint).Version(ctx)
+		if err != nil {
+			return handleErr(err)
+		}
+		bconn, err := rpcc.DialContext(ctx, bver.WebSocketDebuggerURL)
+		if err != nil {
+			return handleErr(err)
+		}
+
+		w.rpccConn = bconn
+	}
+
+	if w.cdpClient == nil {
+		w.cdpClient = cdp.NewClient(w.rpccConn)
+	}
+
+	if w.sessionManager == nil {
+		sess, err := session.NewManager(w.cdpClient)
+		if err != nil {
+			return handleErr(err)
+		}
+
+		w.sessionManager = sess
+	}
+
+	createCtx, err := w.cdpClient.Target.CreateBrowserContext(ctx)
+	if err != nil {
+		return handleErr(err)
+	}
+
+	createTargetArgs := target.NewCreateTargetArgs("about:blank").
+		SetBrowserContextID(createCtx.BrowserContextID)
+	createTarget, err := w.cdpClient.Target.CreateTarget(ctx, createTargetArgs)
+	if err != nil {
+		return handleErr(err)
+	}
+
+	conn, err := w.sessionManager.Dial(ctx, createTarget.TargetID)
+	if err != nil {
+		return handleErr(err)
+	}
+
+	c := cdp.NewClient(conn)
+	closer := func() error {
+		if err := conn.Close(); err != nil {
+			return err
+		}
+
+		closeReply, err := w.cdpClient.Target.CloseTarget(ctx, target.NewCloseTargetArgs(createTarget.TargetID))
+		if err != nil {
+			return err
+		}
+		if !closeReply.Success {
+			return errors.New("could not close target: " + string(createTarget.TargetID))
+		}
+
+		err = w.cdpClient.Target.DisposeBrowserContext(ctx, target.NewDisposeBrowserContextArgs(createCtx.BrowserContextID))
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	return c, closer, nil
+}
+
+func retrieveConsole(conn *godet.RemoteDebugger) ([]string, func()) {
 	var console []string
-	w.rdb.CallbackEvent("Runtime.consoleAPICalled",
+	var m sync.Mutex
+	conn.CallbackEvent("Runtime.consoleAPICalled",
 		godet.ConsoleAPICallback(func(items []interface{}) {
 			if len(items) < 2 {
 				return
@@ -218,9 +389,21 @@ func (w *Worker) fetch(req CrawlRequest) CrawlSession {
 				logMsg += fmt.Sprintf(" %v", items[i])
 			}
 
+			m.Lock()
 			console = append(console, logMsg[1:])
+			m.Unlock()
 		}))
 
+	conn.RuntimeEvents(true)
+
+	return console, func() {
+		conn.RuntimeEvents(false)
+		conn.CallbackEvent("Runtime.consoleAPICalled", nil)
+		m.Lock()
+	}
+}
+
+func retrieveEvents(conn *godet.RemoteDebugger) (<-chan time.Time, map[string][]ChromeEventParam, func()) {
 	raw := map[string][]ChromeEventParam{}
 	var m sync.Mutex
 
@@ -230,7 +413,7 @@ func (w *Worker) fetch(req CrawlRequest) CrawlSession {
 		CHROME_LOADING_FAILED,
 	} {
 		func(e string) {
-			w.rdb.CallbackEvent(e, func(params godet.Params) {
+			conn.CallbackEvent(e, func(params godet.Params) {
 				id, ok := params["requestId"].(string)
 				if !ok {
 					return
@@ -244,317 +427,649 @@ func (w *Worker) fetch(req CrawlRequest) CrawlSession {
 		}(e)
 	}
 
-	tab, err := w.rdb.NewTab("about:blank")
-	if err != nil {
-		return CrawlSession{Error: err}
-	}
-
-	w.rdb.NetworkEvents(true)
-	w.rdb.RuntimeEvents(true)
-	w.rdb.PageEvents(true)
-
-	clear := func() {
-		w.rdb.ClearBrowserCookies()
-		w.rdb.CloseTab(tab)
-	}
-	defer clear()
-
-	if err := w.rdb.ActivateTab(tab); err != nil {
-		return CrawlSession{Error: err}
-	}
-
-	time.Sleep(200 * time.Millisecond)
-
-	starttime := time.Now()
-	if _, err := w.rdb.Navigate(req.Url.String()); err != nil {
-		return CrawlSession{Error: err}
-	}
-	var loadedTime time.Time
-	select {
-	case t := <-stop:
-		loadedTime = t
-	case <-time.After(*w.conf.LoadTimeout):
-		return CrawlSession{Error: fmt.Errorf("Frame load timeout")}
-	}
-
-	screen := make(chan *BrowserScreenshot, 1)
-
-	var wg sync.WaitGroup
-	capture := func(d time.Duration) {
-		time.Sleep(d)
-		ss, err := w.CaptureScreenshot()
-		if err != nil {
-			log.Printf("unable to capture screenshot: %s", err)
+	conn.CallbackEvent(CHROME_LOADING_FINISHED, func(params godet.Params) {
+		id, ok := params["requestId"].(string)
+		if !ok {
+			return
 		}
 
-		screen <- ss
-		wg.Done()
-	}
-
-	for _, timing := range req.Screenshots {
-		wg.Add(1)
-		capture(timing)
-	}
-
-	m.Lock()
-	for id, eps := range raw {
-		body, err := w.rdb.GetResponseBody(id)
+		body, err := conn.GetResponseBody(id)
 		if err != nil {
-			fmt.Println("body error: ", err)
-			continue
+			return
 		}
 
-		params := map[string]interface{}{
+		params = map[string]interface{}{
 			"requestId": id,
 			"body":      body,
 			"sha256":    fmt.Sprintf("%x", sha256.Sum256(body)),
 		}
 
+		m.Lock()
+		eps := raw[id]
 		raw[id] = append(eps, ChromeEventParam{
 			event:  CUSTOM_GOT_BODY,
 			params: params,
 		})
-	}
-	m.Unlock()
+		m.Unlock()
+	})
 
-	wg.Wait()
-	var capturedScreenshots []*BrowserScreenshot
-	for i := 0; i < len(req.Screenshots); i++ {
-		capturedScreenshots = append(capturedScreenshots, <-screen)
-	}
+	frameLoad := make(chan time.Time)
+	conn.CallbackEvent("Page.frameStoppedLoading", func(params godet.Params) {
+		select {
+		case frameLoad <- time.Now():
+		default:
+		}
+	})
 
-	terminateTime := time.Now()
+	conn.NetworkEvents(true)
+	conn.PageEvents(true)
 
-	return CrawlSession{
-		InitialURL:     req.Url.String(),
-		Resolution:     w.conf.Resolution.String(),
-		Actions:        ActionsFromEvents(raw),
-		Console:        console,
-		Screenshots:    capturedScreenshots,
-		StartTime:      starttime,
-		LoadedTime:     loadedTime,
-		TerminatedTime: terminateTime,
+	return frameLoad, raw, func() {
+		conn.NetworkEvents(false)
+		conn.PageEvents(false)
+		for _, e := range []string{
+			"Page.frameStoppedLoading",
+			CHROME_REQ_WILL_BE_SENT,
+			CHROME_RESP_RECEIVED,
+			CHROME_LOADING_FAILED,
+			CHROME_LOADING_FINISHED,
+		} {
+			conn.CallbackEvent(e, nil)
+		}
+		close(frameLoad)
+		m.Lock()
 	}
 }
 
-func (w *Worker) CaptureScreenshot() (*BrowserScreenshot, error) {
-	taken := time.Now()
-	bytes, err := w.rdb.CaptureScreenshot("png", 0, true)
-	if err != nil {
-		return nil, err
+func (w *Worker) fetch(ctx context.Context, req CrawlRequest) CrawlSession {
+	result := CrawlSession{
+		InitialURL:    req.Url,
+		Resolution:    w.conf.Resolution.String(),
+		InitiatedTime: time.Now(),
+	}
+	replyErr := func(err error) CrawlSession {
+		if cdp.ErrorCause(err) == context.DeadlineExceeded {
+			if strings.HasPrefix(err.Error(), "cdp.Page:") {
+				result.Error = ErrTimeoutDOM
+				return result
+			}
+
+			result.Error = context.DeadlineExceeded
+			return result
+		}
+
+		if strings.HasPrefix(err.Error(), "could not resolve") {
+			result.Error = ErrDockerConn
+			return result
+		}
+
+		result.Error = err
+		return result
 	}
 
-	return &BrowserScreenshot{
-		Screenshot: bytes,
-		Taken:      taken,
-	}, nil
+	c, clientClose, err := w.Client(ctx)
+	if err != nil {
+		if err == rpcc.ErrConnClosing {
+			c, clientClose, err = w.Client(ctx)
+			if err != nil {
+				return replyErr(err)
+			}
+		} else {
+			return replyErr(err)
+		}
+	}
+	defer func() {
+		if err := clientClose(); err != nil {
+			w.removeContainer(w.container)
+			c, err := w.createContainer()
+			if err != nil {
+				return
+			}
+			w.container = c
+		}
+	}()
+
+	_, err = c.Page.Navigate(ctx, page.NewNavigateArgs("about:blank"))
+	if err != nil {
+		return replyErr(err)
+	}
+
+	dom, err := c.Page.DOMContentEventFired(ctx)
+	if err != nil {
+		return replyErr(err)
+	}
+	defer dom.Close()
+
+	readRequests := requestsReader(ctx, c.Network)
+	readResponses := responsesReader(ctx, c.Network)
+	readRequestErrors := requestErrorsReader(ctx, c.Network)
+	readBodies := responseBodyReader(ctx, c.Network)
+	readConsole := consoleReader(ctx, c.Runtime)
+
+	if err = c.Page.Enable(ctx); err != nil {
+		return replyErr(err)
+	}
+
+	if err = c.Network.Enable(ctx, nil); err != nil {
+		return replyErr(err)
+	}
+
+	if err = c.Runtime.Enable(ctx); err != nil {
+		return replyErr(err)
+	}
+
+	result.NavigateTime = time.Now()
+	_, err = c.Page.Navigate(ctx, page.NewNavigateArgs(req.Url.String()))
+	if err != nil {
+		return replyErr(err)
+	}
+
+	if _, err := dom.Recv(); err != nil {
+		return replyErr(err)
+	}
+	result.LoadedTime = time.Now()
+	screenshotC := w.captureScreenshots(ctx, c.Page, req.Screenshots...)
+
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			return replyErr(ctx.Err())
+		case screens := <-screenshotC:
+			result.Screenshots = screens
+			result.TerminatedTime = time.Now()
+			break loop
+		}
+	}
+
+	requests, err := readRequests()
+	if err != nil {
+		return replyErr(err)
+	}
+
+	responses, err := readResponses()
+	if err != nil {
+		return replyErr(err)
+	}
+
+	rerrs, err := readRequestErrors()
+	if err != nil {
+		return replyErr(err)
+	}
+
+	bodies, err := readBodies()
+	if err != nil {
+		return replyErr(err)
+	}
+
+	result.Actions = ActionsFromEvents(&BrowserEvents{
+		requests:  requests,
+		responses: responses,
+		errors:    rerrs,
+		bodies:    bodies,
+	})
+
+	for _, a := range result.Actions {
+		u, err := url.Parse(a.Request.URL)
+		if err != nil {
+			continue
+		}
+
+		a.Host = w.getHostInfo(u.Host)
+	}
+	if len(result.Actions) > 0 {
+		if err := result.Actions[0].Error; err != nil {
+			result.Error = fmt.Errorf(*err)
+		}
+
+		if body := result.Actions[0].Body; body != nil {
+			result.DocumentURLs = LinksFromBodies(req.Url, body)
+		}
+	}
+
+	console, err := readConsole()
+	if err != nil {
+		return replyErr(err)
+	}
+	result.Console = console
+
+	return result
+}
+
+func requestsReader(ctx context.Context, net cdp.Network) func() ([]*network.RequestWillBeSentReply, error) {
+	stop := make(chan struct{})
+	var requests []*network.RequestWillBeSentReply
+	var replyErr error
+
+	go func() {
+		reqs, err := net.RequestWillBeSent(ctx)
+		if err != nil {
+			replyErr = err
+			return
+		}
+		defer reqs.Close()
+
+		for {
+			req, err := reqs.Recv()
+			if err != nil {
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			default:
+				requests = append(requests, req)
+			}
+		}
+	}()
+
+	return func() ([]*network.RequestWillBeSentReply, error) {
+		close(stop)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		if replyErr != nil {
+			return nil, replyErr
+		}
+
+		return requests, nil
+	}
+}
+
+func responsesReader(ctx context.Context, net cdp.Network) func() ([]*network.ResponseReceivedReply, error) {
+	stop := make(chan struct{})
+	var responses []*network.ResponseReceivedReply
+	var replyErr error
+
+	go func() {
+		resps, err := net.ResponseReceived(ctx)
+		if err != nil {
+			replyErr = err
+			return
+		}
+		defer resps.Close()
+
+		for {
+			resp, err := resps.Recv()
+			if err != nil {
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			default:
+				responses = append(responses, resp)
+			}
+		}
+	}()
+
+	return func() ([]*network.ResponseReceivedReply, error) {
+		close(stop)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		if replyErr != nil {
+			return nil, replyErr
+		}
+
+		return responses, nil
+	}
+}
+
+func requestErrorsReader(ctx context.Context, net cdp.Network) func() ([]*network.LoadingFailedReply, error) {
+	stop := make(chan struct{})
+	var errors []*network.LoadingFailedReply
+	var replyErr error
+
+	go func() {
+		respErrs, err := net.LoadingFailed(ctx)
+		if err != nil {
+			replyErr = err
+			return
+		}
+		defer respErrs.Close()
+
+		for {
+			respErr, err := respErrs.Recv()
+			if err != nil {
+				return
+			}
+
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			default:
+				errors = append(errors, respErr)
+			}
+		}
+	}()
+
+	return func() ([]*network.LoadingFailedReply, error) {
+		close(stop)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		if replyErr != nil {
+			return nil, replyErr
+		}
+
+		return errors, nil
+	}
+}
+
+type ResponseBody struct {
+	RequestID      network.RequestID
+	Body           []byte
+	Links          []*url.URL
+	ChecksumSha256 string
+}
+
+func responseBodyReader(ctx context.Context, net cdp.Network) func() ([]*ResponseBody, error) {
+	stop := make(chan struct{})
+	var bodies []*ResponseBody
+	var replyErr error
+
+	go func() {
+		loadings, err := net.LoadingFinished(ctx)
+		if err != nil {
+			replyErr = err
+			return
+		}
+		defer loadings.Close()
+
+		for {
+			req, err := loadings.Recv()
+			if err != nil {
+				return
+			}
+
+			bodyReply, err := net.GetResponseBody(ctx, &network.GetResponseBodyArgs{req.RequestID})
+			if err != nil {
+				return
+			}
+
+			var body []byte
+			if bodyReply.Base64Encoded {
+				body, err = base64.StdEncoding.DecodeString(bodyReply.Body)
+				if err != nil {
+					body = []byte(bodyReply.Body)
+				}
+			} else {
+				body = []byte(bodyReply.Body)
+			}
+
+			checksum := fmt.Sprintf("%x", sha256.Sum256(body))
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			default:
+				bodies = append(bodies, &ResponseBody{
+					RequestID:      req.RequestID,
+					Body:           body,
+					ChecksumSha256: checksum,
+				})
+			}
+		}
+	}()
+
+	return func() ([]*ResponseBody, error) {
+		close(stop)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		if replyErr != nil {
+			return nil, replyErr
+		}
+
+		return bodies, nil
+	}
+}
+
+type JavaScriptConsole struct {
+	Msg      string
+	Line     int
+	Column   int
+	Function string
+	URL      string
+}
+
+func consoleReader(ctx context.Context, runt cdp.Runtime) func() ([]*JavaScriptConsole, error) {
+	stop := make(chan struct{})
+	var console []*JavaScriptConsole
+	var replyErr error
+
+	go func() {
+		messages, err := runt.ConsoleAPICalled(ctx)
+		if err != nil {
+			return
+		}
+		defer messages.Close()
+
+		for {
+			msg, err := messages.Recv()
+			if err != nil {
+				return
+			}
+
+			if msg.Type != "log" {
+				continue
+			}
+
+			var txt string
+			for _, o := range msg.Args {
+				txt += fmt.Sprintf("%s ", o.Value)
+			}
+			txt = txt[0 : len(txt)-1]
+
+			cmsg := &JavaScriptConsole{
+				Msg: txt,
+			}
+
+			if st := msg.StackTrace; st != nil && len(st.CallFrames) > 0 {
+				cf := st.CallFrames[0]
+				cmsg.Line = cf.LineNumber
+				cmsg.Column = cf.ColumnNumber
+				cmsg.Function = cf.FunctionName
+				cmsg.URL = cf.URL
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			default:
+				console = append(console, cmsg)
+			}
+		}
+	}()
+
+	return func() ([]*JavaScriptConsole, error) {
+		close(stop)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		if replyErr != nil {
+			return nil, replyErr
+		}
+
+		return console, nil
+	}
+}
+
+func (w *Worker) captureScreenshots(ctx context.Context, pg cdp.Page, durations ...time.Duration) <-chan []*BrowserScreenshot {
+	out := make(chan []*BrowserScreenshot)
+
+	go func() {
+		defer close(out)
+
+		var wg sync.WaitGroup
+		var m sync.Mutex
+		var screenshots []*BrowserScreenshot
+		for _, dur := range durations {
+			wg.Add(1)
+
+			go func(dur time.Duration) {
+				defer wg.Done()
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(dur):
+				}
+
+				taken := time.Now()
+				encoded, err := pg.CaptureScreenshot(ctx, page.NewCaptureScreenshotArgs().SetFormat("png"))
+				if err != nil {
+					return
+				}
+
+				var screenshot []byte
+				if _, err := base64.StdEncoding.Decode(screenshot, encoded.Data); err != nil {
+					screenshot = encoded.Data
+				}
+
+				m.Lock()
+				screenshots = append(screenshots, &BrowserScreenshot{
+					Screenshot: screenshot,
+					Taken:      taken,
+					Resolution: *w.conf.Resolution,
+					Kind:       "png",
+				})
+				m.Unlock()
+
+			}(dur)
+		}
+
+		wg.Wait()
+
+		out <- screenshots
+	}()
+
+	return out
 }
 
 func (w *Worker) Close() {
 	w.kill <- struct{}{}
 
-	if w.rdb != nil {
-		w.rdb.Close()
+	if w.rpccConn != nil {
+		w.rpccConn.Close()
+	}
+
+	if w.sessionManager != nil {
+		w.sessionManager.Close()
 	}
 
 	if w.container != nil {
-		w.conf.DockerClient.RemoveContainer(docker.RemoveContainerOptions{
-			ID:    w.container.ID,
-			Force: true,
-		})
+		w.removeContainer(w.container)
 	}
 }
 
-func ActionsFromEvents(logs map[string][]ChromeEventParam) []*CrawlAction {
-	requests := map[string]*CrawlAction{}
-	requestIsSent := func(params map[string]interface{}, last *CrawlAction) (*CrawlAction, error) {
-		_, performedRedirect := params["redirectResponse"].(map[string]interface{})
-		if performedRedirect && last != nil {
-			if err := last.ReadResponse(params, "redirectResponse"); err != nil {
-				return nil, err
-			}
-		}
+type BrowserEvents struct {
+	requests  []*network.RequestWillBeSentReply
+	responses []*network.ResponseReceivedReply
+	errors    []*network.LoadingFailedReply
+	bodies    []*ResponseBody
+}
 
-		_, ok := params["request"].(map[string]interface{})
-		if !ok {
-			return nil, nil
-		}
+func ActionsFromEvents(events *BrowserEvents) []*CrawlAction {
+	requests := map[network.RequestID]*CrawlAction{}
 
-		a, err := NewCrawlActionFromParams(params)
+	var actions []*CrawlAction
+	for _, sent := range events.requests {
+		u, err := url.Parse(sent.Request.URL)
 		if err != nil {
-			return nil, err
+			continue
 		}
 
-		rid, ok := params["requestId"].(string)
-		if ok {
-			requests[rid] = a
+		if u.Scheme == "data" {
+			continue
 		}
 
-		if id, ok := params["loaderId"].(string); ok {
-			if parent, ok := requests[id]; ok && rid != id {
-				a.Parent = parent
-			}
+		ca := CrawlAction{
+			Initiator: Initiator{
+				Kind: sent.Initiator.Type,
+			},
+			Request: sent.Request,
 		}
 
-		if performedRedirect {
-			a.Initiator.Kind = "redirect"
+		if parent, ok := requests[network.RequestID(sent.LoaderID)]; ok {
+			parent.Response = sent.RedirectResponse
+			ca.Parent = parent
 		}
 
-		return a, nil
+		requests[sent.RequestID] = &ca
+		actions = append(actions, &ca)
 	}
 
-	var sessionActions []*CrawlAction
-	for _, eps := range logs {
-		var actions []*CrawlAction
-		var last *CrawlAction
-		for _, ep := range eps {
-			switch ep.event {
-			case CHROME_REQ_WILL_BE_SENT:
-				a, err := requestIsSent(ep.params, last)
-				if err != nil {
-					log.Printf("error handling \"%s\": %s\n", CHROME_REQ_WILL_BE_SENT, err)
-				}
-
-				if a != nil {
-					if last != nil {
-						a.Parent = last
-					}
-
-					actions = append(actions, a)
-					last = a
-				}
-
-			case CHROME_RESP_RECEIVED:
-				id, ok := ep.params["requestId"].(string)
-				if !ok {
-					continue
-				}
-
-				a, ok := requests[id]
-				if !ok {
-					continue
-				}
-
-				err := a.ReadResponse(ep.params, "response")
-				if err != nil {
-					log.Printf("error handling \"%s\": %s\n", CHROME_RESP_RECEIVED, err)
-				}
-
-			case CHROME_LOADING_FAILED:
-				err := last.ReadError(ep.params)
-				if err != nil {
-					log.Printf("error handling \"%s\": %s\n", CHROME_LOADING_FAILED, err)
-				}
-
-			case CUSTOM_GOT_BODY:
-				id, ok := ep.params["requestId"].(string)
-				if !ok {
-					continue
-				}
-
-				a, ok := requests[id]
-				if !ok {
-					continue
-				}
-
-				if a.Response == nil {
-					var resp BrowserResponse
-					a.Response = &resp
-				}
-
-				a.Response.Body, _ = ep.params["body"].([]byte)
-				a.Response.BodyChecksumSha256, _ = ep.params["sha256"].(string)
-			}
-		}
-
-		sessionActions = append(sessionActions, actions...)
-	}
-
-	sort.Slice(sessionActions,
-		func(i, j int) bool {
-			return sessionActions[i].Timings.StartTime < sessionActions[j].Timings.StartTime
-		})
-
-	if len(sessionActions) > 0 {
-		sessionActions[0].Initiator.Kind = "user"
-	}
-
-	for _, a := range sessionActions {
-		j, _ := json.MarshalIndent(a, "", "  ")
-		fmt.Println(string(j))
-	}
-
-	return sessionActions
-}
-
-func ReadStringFromParams(key string, params map[string]interface{}) (string, error) {
-	v, ok := params[key]
-	if !ok {
-		return "", &NoParamErr{key}
-	}
-
-	vStr, ok := v.(string)
-	if !ok {
-		return "", &NotOfTypeErr{key, "string"}
-	}
-
-	return vStr, nil
-}
-
-func ReadStringSliceFromParams(key string, params map[string]interface{}) ([]string, error) {
-	v, ok := params[key]
-	if !ok {
-		return nil, &NoParamErr{key}
-	}
-
-	notArray := func() ([]string, error) {
-		return nil, &NotOfTypeErr{key, "[]string"}
-	}
-
-	inters, ok := v.([]interface{})
-	if !ok {
-		return notArray()
-	}
-
-	var result []string
-	for _, i := range inters {
-		str, ok := i.(string)
+	for _, recv := range events.responses {
+		req, ok := requests[recv.RequestID]
 		if !ok {
-			return notArray()
+			continue
 		}
 
-		result = append(result, str)
+		req.Response = &recv.Response
 	}
 
-	return result, nil
-}
+	for _, err := range events.errors {
+		req, ok := requests[err.RequestID]
+		if !ok {
+			continue
+		}
 
-func ReadFloatFromParams(key string, params map[string]interface{}) (float64, error) {
-	v, ok := params[key]
-	if !ok {
-		return 0, &NoParamErr{key}
+		if req.Error == nil {
+			req.Error = &err.ErrorText
+		}
 	}
 
-	vFloat, ok := v.(float64)
-	if !ok {
-		return 0, &NotOfTypeErr{key, "float64"}
+	for _, body := range events.bodies {
+		req, ok := requests[body.RequestID]
+		if !ok {
+			continue
+		}
+
+		req.Body = body
 	}
 
-	return vFloat, nil
-}
+	for _, a := range actions {
+		if a.Parent != nil && a.Parent.Response != nil {
+			sc := a.Parent.Response.Status
+			if sc >= 300 && sc < 400 {
+				a.Initiator.Kind = "redirect"
+			}
+			continue
+		}
 
-func GetParamsFromParams(key string, params map[string]interface{}) (map[string]interface{}, error) {
-	v, ok := params[key]
-	if !ok {
-		return nil, &NoParamErr{key}
+		a.Initiator.Kind = "user"
 	}
 
-	vMap, ok := v.(map[string]interface{})
-	if !ok {
-		return nil, &NotOfTypeErr{key, "map[string]interface{}"}
-	}
-
-	return vMap, nil
+	return actions
 }
 
 func GetAvailablePort() uint {
@@ -574,38 +1089,110 @@ func PullImage(c *docker.Client, img string) error {
 	}, docker.AuthConfiguration{})
 }
 
-func WaitForInstance(endpoint string, max time.Duration) {
-	t := time.NewTicker(max)
-	defer t.Stop()
+func LinksFromBodies(host *url.URL, bodies ...*ResponseBody) []*url.URL {
+	var links []*url.URL
+	for _, b := range bodies {
+		l, _ := RetrieveLinks(host, b.Body)
+		links = append(links, l...)
+	}
+
+	return links
+}
+
+func WaitForEndpoint(ctx context.Context, endpoint string) error {
+	connect := func() error {
+		devt := devtool.New(endpoint)
+		pt, err := devt.Get(ctx, devtool.Page)
+		if err != nil {
+			pt, err = devt.Create(ctx)
+			if err != nil {
+				return err
+			}
+		}
+
+		conn, err := rpcc.DialContext(ctx, pt.WebSocketDebuggerURL)
+		if err != nil {
+			return err
+		}
+		conn.Close()
+		return nil
+	}
 
 	for {
-		conn, _ := godet.Connect(endpoint, false)
 		select {
-		case <-t.C:
-			return
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
-			if conn != nil {
-				conn.Close()
-				return
-			}
+			if err := connect(); err != nil {
+				if strings.Contains(err.Error(), "connection reset") {
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
 
-			time.Sleep(time.Second)
+				return err
+			}
 		}
+
+		return nil
 
 	}
 }
 
-type workerController struct {
-	m         sync.Mutex
-	workers   []*Worker
-	dclient   *docker.Client
-	us        URLStore
-	tasks     chan CrawlRequest
-	responses chan CrawlSession
-	stop      chan bool
+type URLStore interface {
+	Sample() (*url.URL, error)
+	Add(urls ...*url.URL) (int, error)
+	Visit(u *url.URL, t time.Time) error
+	Size() int
 }
 
-func NewWorkerController(us URLStore) (*workerController, error) {
+type SessionStore interface {
+	SaveSession(CrawlSession) error
+}
+
+type SavedSession struct {
+	Error         error
+	Session       *CrawlSession
+	CrawlDuration time.Duration
+	StoreDuration time.Duration
+}
+
+func (ss *SavedSession) String() string {
+	state := "✔"
+	if ss.Session.Error != nil {
+		state = "✘ "
+	}
+
+	err := ""
+	if ss.Session.Error != nil {
+		err = fmt.Sprintf("(error: %s)", ss.Session.Error)
+	}
+
+	str := fmt.Sprintf("%s %-8s%s%s (duration: %v) %s",
+		state,
+		"["+ss.Session.InitialURL.Scheme+"]",
+		ss.Session.InitialURL.Host,
+		ss.Session.InitialURL.Path,
+		ss.CrawlDuration,
+		err,
+	)
+
+	return str
+}
+
+type WorkerController struct {
+	m              sync.Mutex
+	workers        []*Worker
+	dclient        *docker.Client
+	us             URLStore
+	ss             SessionStore
+	recentSessions []*SavedSession
+	ready          chan bool
+	tasks          chan CrawlRequest
+	responses      chan CrawlSession
+	stop           chan bool
+}
+
+func NewWorkerController(us URLStore, ss SessionStore) (*WorkerController, error) {
 	dclient, err := docker.NewClient("unix:///var/run/docker.sock")
 	if err != nil {
 		return nil, err
@@ -614,39 +1201,75 @@ func NewWorkerController(us URLStore) (*workerController, error) {
 	tasks := make(chan CrawlRequest)
 	responses := make(chan CrawlSession)
 	stop := make(chan bool)
+	ready := make(chan bool, 1)
 
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-
-			u, err := us.Sample()
-			if err != nil {
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-
-			select {
-			case <-stop:
-				return
-			case tasks <- CrawlRequest{Url: u}:
-			}
-		}
-	}()
-
-	return &workerController{
+	wc := &WorkerController{
 		tasks:     tasks,
 		responses: responses,
 		us:        us,
+		ss:        ss,
 		dclient:   dclient,
 		stop:      stop,
-	}, nil
+		ready:     ready,
+	}
+
+	go wc.startQueue()
+	go func() {
+		wc.recentSessions = make([]*SavedSession, 50)
+		for {
+			select {
+			case sess := <-responses:
+				t := time.Now()
+				err := ss.SaveSession(sess)
+				us.Visit(sess.InitialURL, time.Now())
+				us.Add(sess.DocumentURLs...)
+				wc.recentSessions = append(wc.recentSessions[1:len(wc.recentSessions)],
+					&SavedSession{
+						Session:       &sess,
+						Error:         err,
+						StoreDuration: time.Since(t),
+						CrawlDuration: time.Since(sess.InitiatedTime),
+					})
+				ready <- true
+			case <-wc.stop:
+				return
+			}
+		}
+
+	}()
+
+	return wc, nil
 }
 
-func (wc *workerController) AddWorker() error {
+func (wc *WorkerController) startQueue() {
+	for {
+		var u *url.URL
+		var err error
+
+		select {
+		case <-wc.stop:
+			return
+		case <-wc.ready:
+			u, err = wc.us.Sample()
+			if err != nil {
+				select {
+				case <-time.After(500 * time.Millisecond):
+					continue
+				case <-wc.stop:
+					return
+				}
+			}
+		}
+
+		select {
+		case <-wc.stop:
+			return
+		case wc.tasks <- CrawlRequest{Url: u, Screenshots: []time.Duration{time.Second}}:
+		}
+	}
+}
+
+func (wc *WorkerController) AddWorker() error {
 	wc.m.Lock()
 	defer wc.m.Unlock()
 
@@ -659,11 +1282,70 @@ func (wc *workerController) AddWorker() error {
 		return err
 	}
 	wc.workers = append(wc.workers, w)
+	wc.ready <- true
 
 	return nil
 }
 
-func (wc *workerController) Close() {
+func (wc *WorkerController) FactWidget() ui.Drawable {
+	fw := widgets.NewList()
+	update := func() {
+		fw.Rows = []string{
+			fmt.Sprintf("Known URLs: %d", wc.us.Size()),
+		}
+	}
+
+	go func() {
+		update()
+
+		ticker := time.NewTicker(2 * time.Second)
+		for range ticker.C {
+			update()
+		}
+	}()
+
+	fw.Title = "Facts"
+	fw.BorderStyle = ui.NewStyle(ui.ColorGreen)
+
+	return fw
+}
+
+func (wc *WorkerController) FactRecentSessions() ui.Drawable {
+	rs := widgets.NewList()
+	update := func() {
+		var rows []string
+
+		for i := len(wc.recentSessions) - 1; i >= 0; i-- {
+			s := wc.recentSessions[i]
+			if s != nil {
+				rows = append(rows, s.String())
+			}
+		}
+
+		rs.Rows = rows
+	}
+
+	go func() {
+		update()
+
+		ticker := time.NewTicker(2 * time.Second)
+		for {
+			select {
+			case <-wc.stop:
+				return
+			case <-ticker.C:
+				update()
+			}
+		}
+	}()
+
+	rs.Title = "Fetched (Recent)"
+	rs.BorderStyle = ui.NewStyle(ui.ColorBlue)
+
+	return rs
+}
+
+func (wc *WorkerController) Close() {
 	wc.m.Lock()
 	defer wc.m.Unlock()
 
@@ -685,6 +1367,44 @@ func timeoutAction(f func() error, d time.Duration) error {
 	case err := <-errc:
 		return err
 	case <-time.After(d):
-		return FuncTimeoutErr
+		return ErrFuncTimeout
 	}
+}
+
+func errorFuncWithContext(ctx context.Context, f func() error) <-chan error {
+	errc := make(chan error)
+
+	go func() {
+		defer close(errc)
+		errc <- f()
+	}()
+
+	return errc
+}
+
+func GetHostInfo(domain Domain) (Host, error) {
+	h := Host{
+		Domain: domain,
+	}
+	replyErr := func(err error) (Host, error) {
+		return h, err
+	}
+
+	nss, _ := net.LookupNS(string(domain))
+	for _, ns := range nss {
+		h.NameServers = append(h.NameServers, ns.Host)
+	}
+
+	ips, err := net.LookupIP(string(domain))
+	if err != nil {
+		return replyErr(err)
+	}
+
+	if len(ips) == 0 {
+		return replyErr(nil)
+	}
+
+	h.IPAddr = ips[0].String()
+
+	return h, nil
 }

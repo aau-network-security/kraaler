@@ -1,6 +1,7 @@
 package kraaler_test
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -59,11 +60,14 @@ func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool,
 	q := make(chan kraaler.CrawlRequest, 1)
 	resps := make(chan kraaler.CrawlSession, 1)
 
+	endpoint := fmt.Sprintf("http://localhost:%d", port)
+	kraaler.WaitForEndpoint(context.Background(), endpoint)
+
 	second := time.Second
 	w, err := kraaler.NewWorker(kraaler.WorkerConfig{
 		Queue:       q,
 		Responses:   resps,
-		UseInstance: fmt.Sprintf("localhost:%d", port),
+		UseInstance: endpoint,
 		LoadTimeout: &second,
 	})
 	if err != nil {
@@ -71,6 +75,9 @@ func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool,
 	}
 	defer w.Close()
 
+	if ts.URL == "" {
+		ts.URL = "http://127.0.0.1:7272"
+	}
 	u, err := url.Parse(ts.URL)
 	if err != nil {
 		return nil, err
@@ -99,7 +106,7 @@ func codesAre(codes ...int) validator {
 		}
 
 		for i, c := range codes {
-			if sc := s.Actions[i].Response.StatusCode; sc != c {
+			if sc := s.Actions[i].Response.Status; sc != c {
 				return fmt.Errorf("expected action with index %d to be %d (status code), but it is: %d", i, c, sc)
 			}
 		}
@@ -115,7 +122,19 @@ func bodiesAre(bodies ...string) validator {
 		}
 
 		for i, b := range bodies {
-			if fetched := strings.TrimSpace(string(s.Actions[i].Response.Body)); fetched != b {
+			if b == "" {
+				if s.Actions[i].Body != nil {
+					return fmt.Errorf("expected body to be nil")
+				}
+
+				return nil
+			}
+
+			if s.Actions[i].Body == nil {
+				return fmt.Errorf("body (index: %d) is nil, but expected: \"%s\"", i, b)
+			}
+
+			if fetched := strings.TrimSpace(string(s.Actions[i].Body.Body)); fetched != b {
 				return fmt.Errorf("unexpected body (%s), expected: %s", fetched, b)
 			}
 		}
@@ -133,6 +152,35 @@ func initiatorsAre(inits ...string) validator {
 		for i, expected := range inits {
 			if init := strings.TrimSpace(string(s.Actions[i].Initiator.Kind)); init != expected {
 				return fmt.Errorf("unexpected initiator (%s), expected: %s", init, expected)
+			}
+		}
+
+		return nil
+	}
+}
+
+func errorsAre(errors ...string) validator {
+	return func(s kraaler.CrawlSession) error {
+		if len(errors) != len(s.Actions) {
+			return fmt.Errorf("expected %d actions, but received: %d", len(errors), len(s.Actions))
+		}
+
+		for i, expected := range errors {
+			err := s.Actions[i].Error
+			if expected == "" {
+				if err != nil {
+					return fmt.Errorf("expected error to be empty, but is \"%s\"", *err)
+				}
+
+				continue
+			}
+
+			if err == nil {
+				return fmt.Errorf("expected error to be \"%s\", but is nil", expected)
+			}
+
+			if err := strings.TrimSpace(*err); err != expected {
+				return fmt.Errorf("unexpected error (%s), expected: %s", err, expected)
 			}
 		}
 
@@ -182,8 +230,8 @@ func consoleIs(c []string) validator {
 		}
 
 		for i, expected := range c {
-			if s.Console[i] != expected {
-				return fmt.Errorf("unexpected output (%s), expected: %s", s.Console[i], expected)
+			if msg := s.Console[i].Msg; msg != expected {
+				return fmt.Errorf("unexpected output (%s), expected: %s", msg, expected)
 			}
 		}
 
@@ -208,7 +256,7 @@ func postDataIs(str string) validator {
 
 func securityDetailsPresent(s kraaler.CrawlSession) error {
 	for i, a := range s.Actions {
-		if a.SecurityDetails == nil {
+		if a.Response.SecurityDetails == nil {
 			return fmt.Errorf("expected security details to be non-nil (request n: %d)", i+1)
 		}
 	}
@@ -287,7 +335,8 @@ func TestCrawl(t *testing.T) {
 			name:    "no server",
 			handler: nil,
 			validator: join(
-				hasActionCount(0),
+				hasActionCount(1),
+				errorsAre("net::ERR_CONNECTION_REFUSED"),
 			),
 		},
 		{
@@ -307,7 +356,7 @@ func TestCrawl(t *testing.T) {
 			validator: join(
 				hasActionCount(1),
 				initiatorsAre("user"),
-				consoleIs([]string{"a a", "b"}),
+				consoleIs([]string{`"a a"`, `"b"`}),
 				codesAre(http.StatusOK),
 				mimeIs("text/html"),
 			),
@@ -367,14 +416,17 @@ func TestCrawl(t *testing.T) {
 				}
 			}()
 
-			var wait *time.Duration
-			var ti time.Duration
-			if tc.wait != ti {
-				wait = &tc.wait
+			dur := 200 * time.Millisecond
+			if tc.wait > dur {
+				dur = tc.wait
 			}
 
-			resp, err := responseFromServerWithHandler(tc.handler, port, tc.tls, wait)
+			resp, err := responseFromServerWithHandler(tc.handler, port, tc.tls, &dur)
 			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := resp.Error; err != nil {
 				t.Fatal(err)
 			}
 

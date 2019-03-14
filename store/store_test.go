@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aau-network-security/kraaler"
+	"github.com/mafredri/cdp/protocol/network"
 	_ "github.com/mattn/go-sqlite3"
 	cache "github.com/patrickmn/go-cache"
 )
@@ -151,14 +153,16 @@ func getDB(name string) (*sql.DB, string, error) {
 }
 
 func TestSessionStore(t *testing.T) {
+
+	aauURL, _ := url.Parse("http://aau.dk")
 	tt := []struct {
 		name string
 		sess kraaler.CrawlSession
 	}{
 		{name: "basic", sess: kraaler.CrawlSession{
-			InitialURL:     "http://aau.dk",
+			InitialURL:     aauURL,
 			Resolution:     "800x600",
-			StartTime:      time.Now(),
+			NavigateTime:   time.Now(),
 			LoadedTime:     time.Now(),
 			TerminatedTime: time.Now(),
 		}},
@@ -198,7 +202,7 @@ func TestSessionStore(t *testing.T) {
 			if err := integerFieldsNonZero(tx, "fact_sessions",
 				"id",
 				"resolution_id",
-				"start_time",
+				"navigated_time",
 				"loaded_time",
 				"terminated_time",
 			); err != nil {
@@ -211,9 +215,12 @@ func TestSessionStore(t *testing.T) {
 func TestConsoleStore(t *testing.T) {
 	tt := []struct {
 		name    string
-		console []string
+		console []*kraaler.JavaScriptConsole
 	}{
-		{name: "basic", console: []string{"debug", "test"}},
+		{name: "basic", console: []*kraaler.JavaScriptConsole{
+			&kraaler.JavaScriptConsole{Msg: "hello"},
+			&kraaler.JavaScriptConsole{Msg: "hello2"},
+		}},
 	}
 
 	table := "fact_console_output"
@@ -328,33 +335,32 @@ func TestActionStore(t *testing.T) {
 						Function:   func(s string) *string { return &s }("some_func"),
 					},
 				},
-				Protocol: func(s string) *string { return &s }("http 1/1"),
-				HostIP:   func(s string) *string { return &s }("192.168.1.1"),
-				SecurityDetails: &kraaler.BrowserSecurityDetails{
-					Protocol:    "RSA",
-					KeyExchange: "TEX",
-					Cipher:      "TUX",
-					SubjectName: "aau.dk",
-					Issuer:      "Comodo",
-					ValidFrom:   time.Now(),
-					ValidTo:     time.Now(),
+				Host: kraaler.Host{
+					Domain: "aau.dk",
+					IPAddr: "8.8.8.8",
 				},
-				Request: kraaler.BrowserRequest{
+				Request: network.Request{
 					URL:    "http://aau.dk",
 					Method: "GET",
-					Headers: map[string]string{
-						"User-Agent": "Chrome",
-						"Date":       "Today",
-					},
+					Headers: network.Headers([]byte(
+						`{ "User-Agent": "Chrome", "Date": "Today"}`,
+					)),
 					PostData: func(s string) *string { return &s }("some_post"),
 				},
-				Response: &kraaler.BrowserResponse{
-					StatusCode: http.StatusOK,
-					Headers: map[string]string{
-						"Server": "nginx",
-					},
+				Response: &network.Response{
+					Status:   http.StatusOK,
+					Protocol: func(s string) *string { return &s }("http"),
+					Headers: network.Headers([]byte(
+						`{ "Server": "nginx" }`,
+					)),
 					MimeType: "text/plain",
-					Body:     []byte("hello world"),
+					SecurityDetails: &network.SecurityDetails{
+						Protocol: "Test",
+						Issuer:   "Test",
+					},
+				},
+				Body: &kraaler.ResponseBody{
+					Body: []byte("hello world"),
 				},
 			},
 			tableDiff: map[string]int{
@@ -376,7 +382,7 @@ func TestActionStore(t *testing.T) {
 				"dim_url_raw_queries": 0,
 				"fact_urls":           1,
 
-				"dim_mime_types": 1,
+				"dim_mime_types": 2,
 				"fact_bodies":    1,
 
 				"fact_post_data":       1,
