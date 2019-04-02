@@ -78,7 +78,19 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
-		renderUI(wc)
+		wc.AddWorker()
+		wc.AddWorker()
+		wc.AddWorker()
+		wc.AddWorker()
+		wc.AddWorker()
+		wc.AddWorker()
+		wc.AddWorker()
+		wc.AddWorker()
+		wc.AddWorker()
+
+		// renderUI(wc)
+		time.Sleep(time.Minute * 60 * 24)
+		fmt.Println("done!")
 	},
 }
 

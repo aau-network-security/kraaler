@@ -37,7 +37,7 @@ func TestURLStore(t *testing.T) {
 			}
 			defer os.RemoveAll(fn)
 
-			us, err := NewURLStore(db, nil)
+			us, err := NewURLStore(db)
 			if err != nil {
 				t.Fatalf("unable to create url store: %s", err)
 			}
@@ -50,7 +50,7 @@ func TestURLStore(t *testing.T) {
 				t.Fatalf("unable to open db again: %s", err)
 			}
 
-			us2, err := NewURLStore(db2, nil)
+			us2, err := NewURLStore(db2)
 			if err != nil {
 				t.Fatalf("unable to create url store: %s", err)
 			}

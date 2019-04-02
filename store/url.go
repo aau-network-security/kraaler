@@ -21,10 +21,11 @@ var (
 type URLFilter func(*url.URL) bool
 
 type urlStore struct {
-	m       sync.RWMutex
-	db      *sql.DB
-	sampler Sampler
-	filters []URLFilter
+	m          sync.RWMutex
+	db         *sql.DB
+	sampler    Sampler
+	resampling bool
+	filters    []URLFilter
 
 	strings map[string]*url.URL
 	urls    map[*url.URL]*time.Time
@@ -42,7 +43,27 @@ func OnlyTLD(ending string) func(*url.URL) bool {
 	}
 }
 
-func NewURLStore(db *sql.DB, sampler Sampler, filters ...URLFilter) (*urlStore, error) {
+type URLStoreOpt func(*urlStore)
+
+func WithURLFilters(f ...URLFilter) URLStoreOpt {
+	return func(u *urlStore) {
+		u.filters = append(u.filters, f...)
+	}
+}
+
+func WithSampler(s Sampler) URLStoreOpt {
+	return func(u *urlStore) {
+		u.sampler = s
+	}
+}
+
+func WithNoResampling() URLStoreOpt {
+	return func(u *urlStore) {
+		u.resampling = false
+	}
+}
+
+func NewURLStore(db *sql.DB, opts ...URLStoreOpt) (*urlStore, error) {
 	if _, err := db.Exec(urlStoreSchema); err != nil {
 		return nil, err
 	}
@@ -53,9 +74,18 @@ func NewURLStore(db *sql.DB, sampler Sampler, filters ...URLFilter) (*urlStore, 
 	}
 	defer rows.Close()
 
-	strings := map[string]*url.URL{}
-	ids := map[*url.URL]int64{}
-	urls := map[*url.URL]*time.Time{}
+	us := &urlStore{
+		db:         db,
+		sampler:    UniformSampler(),
+		resampling: true,
+		urls:       map[*url.URL]*time.Time{},
+		ids:        map[*url.URL]int64{},
+		strings:    map[string]*url.URL{},
+	}
+
+	for _, opt := range opts {
+		opt(us)
+	}
 
 	for rows.Next() {
 		var id int64
@@ -72,24 +102,17 @@ func NewURLStore(db *sql.DB, sampler Sampler, filters ...URLFilter) (*urlStore, 
 			return nil, err
 		}
 
-		strings[urlStr] = u
-		ids[u] = id
-		urls[u] = nil
+		us.strings[urlStr] = u
+		us.ids[u] = id
+		us.urls[u] = nil
 
-		if unixTime.Valid {
+		if unixTime.Valid && us.resampling {
 			t := time.Unix(unixTime.Int64, 0)
-			urls[u] = &t
+			us.urls[u] = &t
 		}
 	}
 
-	return &urlStore{
-		db:      db,
-		sampler: sampler,
-		urls:    urls,
-		ids:     ids,
-		strings: strings,
-		filters: filters,
-	}, nil
+	return us, nil
 }
 
 func (us *urlStore) Size() int {
@@ -198,7 +221,14 @@ func (us *urlStore) Visit(u *url.URL, t time.Time) error {
 			return err
 		}
 
+		if !us.resampling {
+			delete(us.urls, u)
+			us.m.Unlock()
+			return nil
+		}
+
 		us.urls[u] = &t
+
 	}
 	us.m.Unlock()
 
@@ -232,7 +262,24 @@ func (us *urlStore) FilterKnown(doms <-chan kraaler.Domain) <-chan kraaler.Domai
 	return out
 }
 
-type Sampler func(queued map[*url.URL]*time.Time) *url.URL
+type Sampler func(map[*url.URL]*time.Time) *url.URL
+
+func UniformSampler() Sampler {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	return func(urls map[*url.URL]*time.Time) *url.URL {
+		i := r.Intn(len(urls))
+		for u := range urls {
+			if i == 0 {
+				return u
+			}
+
+			i--
+		}
+
+		return nil
+	}
+}
 
 func PairSampler(pw int) Sampler {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))

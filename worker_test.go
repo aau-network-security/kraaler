@@ -45,7 +45,7 @@ func getAvailablePort() uint {
 	return uint(p)
 }
 
-func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool, dur *time.Duration) (*kraaler.CrawlSession, error) {
+func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool, dur *time.Duration) (*kraaler.Page, error) {
 	ts := httptest.NewUnstartedServer(handler)
 	if handler != nil {
 		if useTLS {
@@ -58,7 +58,7 @@ func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool,
 	defer ts.Close()
 
 	q := make(chan kraaler.CrawlRequest, 1)
-	resps := make(chan kraaler.CrawlSession, 1)
+	resps := make(chan kraaler.Page, 1)
 
 	endpoint := fmt.Sprintf("http://localhost:%d", port)
 	kraaler.WaitForEndpoint(context.Background(), endpoint)
@@ -71,7 +71,7 @@ func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool,
 		LoadTimeout: &second,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("new worker error: %s", err)
 	}
 	defer w.Close()
 
@@ -97,10 +97,10 @@ func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool,
 	return &r, nil
 }
 
-type validator func(kraaler.CrawlSession) error
+type validator func(kraaler.Page) error
 
 func codesAre(codes ...int) validator {
-	return func(s kraaler.CrawlSession) error {
+	return func(s kraaler.Page) error {
 		if len(codes) != len(s.Actions) {
 			return fmt.Errorf("expected %d codes, but received: %d", len(codes), len(s.Actions))
 		}
@@ -116,7 +116,7 @@ func codesAre(codes ...int) validator {
 }
 
 func bodiesAre(bodies ...string) validator {
-	return func(s kraaler.CrawlSession) error {
+	return func(s kraaler.Page) error {
 		if len(bodies) != len(s.Actions) {
 			return fmt.Errorf("expected %d bodies, but received: %d", len(bodies), len(s.Actions))
 		}
@@ -144,7 +144,7 @@ func bodiesAre(bodies ...string) validator {
 }
 
 func initiatorsAre(inits ...string) validator {
-	return func(s kraaler.CrawlSession) error {
+	return func(s kraaler.Page) error {
 		if len(inits) != len(s.Actions) {
 			return fmt.Errorf("expected %d initators, but received: %d", len(inits), len(s.Actions))
 		}
@@ -160,7 +160,7 @@ func initiatorsAre(inits ...string) validator {
 }
 
 func errorsAre(errors ...string) validator {
-	return func(s kraaler.CrawlSession) error {
+	return func(s kraaler.Page) error {
 		if len(errors) != len(s.Actions) {
 			return fmt.Errorf("expected %d actions, but received: %d", len(errors), len(s.Actions))
 		}
@@ -189,7 +189,7 @@ func errorsAre(errors ...string) validator {
 }
 
 func mimeIs(str string) validator {
-	return func(s kraaler.CrawlSession) error {
+	return func(s kraaler.Page) error {
 		actions := s.Actions
 		if b := strings.TrimSpace(string(actions[len(actions)-1].Response.MimeType)); b != str {
 			return fmt.Errorf("unexpected body (%s), expected: %s", b, str)
@@ -199,7 +199,7 @@ func mimeIs(str string) validator {
 }
 
 func hasActionCount(n int) validator {
-	return func(s kraaler.CrawlSession) error {
+	return func(s kraaler.Page) error {
 		if len(s.Actions) != n {
 			return fmt.Errorf("expected %d amount of actions, but got: %d", n, len(s.Actions))
 		}
@@ -208,7 +208,7 @@ func hasActionCount(n int) validator {
 }
 
 func join(v validator, vs ...validator) validator {
-	return func(r kraaler.CrawlSession) error {
+	return func(r kraaler.Page) error {
 		if err := v(r); err != nil {
 			return err
 		}
@@ -224,7 +224,7 @@ func join(v validator, vs ...validator) validator {
 }
 
 func consoleIs(c []string) validator {
-	return func(s kraaler.CrawlSession) error {
+	return func(s kraaler.Page) error {
 		if n := len(s.Console); len(c) != n {
 			return fmt.Errorf("unexpected length of console: %d", n)
 		}
@@ -240,7 +240,7 @@ func consoleIs(c []string) validator {
 }
 
 func postDataIs(str string) validator {
-	return func(s kraaler.CrawlSession) error {
+	return func(s kraaler.Page) error {
 		postdata := s.Actions[len(s.Actions)-1].Request.PostData
 		if postdata == nil {
 			return fmt.Errorf("expected post data to be (%s), but it is nil", str)
@@ -254,7 +254,7 @@ func postDataIs(str string) validator {
 	}
 }
 
-func securityDetailsPresent(s kraaler.CrawlSession) error {
+func securityDetailsPresent(s kraaler.Page) error {
 	for i, a := range s.Actions {
 		if a.Response.SecurityDetails == nil {
 			return fmt.Errorf("expected security details to be non-nil (request n: %d)", i+1)
@@ -423,10 +423,6 @@ func TestCrawl(t *testing.T) {
 
 			resp, err := responseFromServerWithHandler(tc.handler, port, tc.tls, &dur)
 			if err != nil {
-				t.Fatal(err)
-			}
-
-			if err := resp.Error; err != nil {
 				t.Fatal(err)
 			}
 

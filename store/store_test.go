@@ -157,9 +157,9 @@ func TestSessionStore(t *testing.T) {
 	aauURL, _ := url.Parse("http://aau.dk")
 	tt := []struct {
 		name string
-		sess kraaler.CrawlSession
+		page kraaler.Page
 	}{
-		{name: "basic", sess: kraaler.CrawlSession{
+		{name: "basic", page: kraaler.Page{
 			InitialURL:     aauURL,
 			Resolution:     "800x600",
 			NavigateTime:   time.Now(),
@@ -187,7 +187,7 @@ func TestSessionStore(t *testing.T) {
 			}
 			defer tx.Rollback()
 
-			if _, err := ss.Save(tx, &tc.sess); err != nil {
+			if _, err := ss.Save(tx, &tc.page); err != nil {
 				t.Fatalf("unable to save session: %s", err)
 			}
 

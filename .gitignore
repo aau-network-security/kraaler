@@ -1,2 +1,4 @@
 app/*.txt
 app/main
+app/app
+app/build.sh

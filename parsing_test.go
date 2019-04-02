@@ -1,13 +1,14 @@
 package kraaler_test
 
 import (
+	"net/url"
 	"testing"
 
 	"github.com/aau-network-security/kraaler"
 )
 
 func TestRetrieveLinks(t *testing.T) {
-	domain := "https://test.com"
+	domain, _ := url.Parse("https://test.com")
 	tt := []struct {
 		name string
 		src  string
@@ -24,14 +25,7 @@ func TestRetrieveLinks(t *testing.T) {
 			name: "relative valid",
 			src:  `<html><a href="/search">t</a></html>`,
 			urls: []string{
-				domain + "/search",
-			},
-		},
-		{
-			name: "text valid",
-			src:  `<html><div>https://google.com</div></html>`,
-			urls: []string{
-				"https://google.com",
+				domain.String() + "/search",
 			},
 		},
 		{
@@ -49,7 +43,7 @@ func TestRetrieveLinks(t *testing.T) {
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
-			found, err := kraaler.RetrieveLinks(domain, tc.src)
+			found, err := kraaler.RetrieveLinks(domain, []byte(tc.src))
 			if err != nil {
 				t.Fatalf("unexpected error: %s", err)
 			}

@@ -125,7 +125,7 @@ type Initiator struct {
 	Stack *CallFrame
 }
 
-type CrawlSession struct {
+type Page struct {
 	InitialURL   *url.URL
 	Actions      []*CrawlAction
 	Resolution   string

@@ -74,7 +74,7 @@ type Worker struct {
 
 type WorkerConfig struct {
 	Queue        <-chan CrawlRequest
-	Responses    chan<- CrawlSession
+	Responses    chan<- Page
 	DockerClient *docker.Client
 	UseInstance  string
 	Resolution   *Resolution
@@ -109,10 +109,10 @@ func NewWorker(conf WorkerConfig) (*Worker, error) {
 	w := &Worker{
 		id:       id,
 		conf:     conf,
+		endpoint: conf.UseInstance,
 		hostInfo: cache.New(2*time.Minute, 30*time.Second),
 	}
 
-	w.endpoint = conf.UseInstance
 	if w.endpoint == "" {
 		c, err := w.createContainer()
 		if err != nil {
@@ -126,7 +126,7 @@ func NewWorker(conf WorkerConfig) (*Worker, error) {
 	return w, nil
 }
 
-func (w *Worker) listen(queue <-chan CrawlRequest, results chan<- CrawlSession) {
+func (w *Worker) listen(queue <-chan CrawlRequest, results chan<- Page) {
 	errCheck := func(errs ...error) func(error) bool {
 		return func(err error) bool {
 			for _, e := range errs {
@@ -138,7 +138,7 @@ func (w *Worker) listen(queue <-chan CrawlRequest, results chan<- CrawlSession) 
 		}
 	}
 	w.kill = make(chan struct{})
-	fetch := func(req CrawlRequest) CrawlSession {
+	fetch := func(req CrawlRequest) Page {
 		resetErrs := errCheck(context.DeadlineExceeded, ErrDockerConn)
 
 		for {
@@ -481,13 +481,14 @@ func retrieveEvents(conn *godet.RemoteDebugger) (<-chan time.Time, map[string][]
 	}
 }
 
-func (w *Worker) fetch(ctx context.Context, req CrawlRequest) CrawlSession {
-	result := CrawlSession{
+func (w *Worker) fetch(ctx context.Context, req CrawlRequest) Page {
+	fmt.Printf("[%s] fetching %s\n", w.id, req.Url.String())
+	result := Page{
 		InitialURL:    req.Url,
 		Resolution:    w.conf.Resolution.String(),
 		InitiatedTime: time.Now(),
 	}
-	replyErr := func(err error) CrawlSession {
+	replyErr := func(err error) Page {
 		if cdp.ErrorCause(err) == context.DeadlineExceeded {
 			if strings.HasPrefix(err.Error(), "cdp.Page:") {
 				result.Error = ErrTimeoutDOM
@@ -1124,9 +1125,11 @@ func WaitForEndpoint(ctx context.Context, endpoint string) error {
 			return ctx.Err()
 		default:
 			if err := connect(); err != nil {
-				if strings.Contains(err.Error(), "connection reset") {
-					time.Sleep(500 * time.Millisecond)
-					continue
+				for _, s := range []string{"connection reset", "connection refused"} {
+					if strings.Contains(err.Error(), s) {
+						time.Sleep(500 * time.Millisecond)
+						continue
+					}
 				}
 
 				return err
@@ -1145,13 +1148,13 @@ type URLStore interface {
 	Size() int
 }
 
-type SessionStore interface {
-	SaveSession(CrawlSession) error
+type PageStore interface {
+	SaveSession(Page) error
 }
 
 type SavedSession struct {
 	Error         error
-	Session       *CrawlSession
+	Session       *Page
 	CrawlDuration time.Duration
 	StoreDuration time.Duration
 }
@@ -1179,37 +1182,59 @@ func (ss *SavedSession) String() string {
 	return str
 }
 
+type PageHandleFunc func(Page)
+type PageMiddleware func(PageHandleFunc) PageHandleFunc
+
+type URLHandleFunc func(*url.URL)
+type URLMiddleware func(URLHandleFunc) URLHandleFunc
+
+func SkipURLsMiddleware(URLHandleFunc) URLHandleFunc {
+	return func(*url.URL) {
+		return
+	}
+}
+
+type WorkerControllerConfig struct {
+	DockerClient   *docker.Client
+	URLStore       URLStore
+	PageStore      PageStore
+	PageMiddleware []PageMiddleware
+	URLMiddleware  []URLMiddleware
+}
+
 type WorkerController struct {
 	m              sync.Mutex
+	ctx            context.Context
+	conf           WorkerControllerConfig
 	workers        []*Worker
-	dclient        *docker.Client
-	us             URLStore
-	ss             SessionStore
 	recentSessions []*SavedSession
 	ready          chan bool
 	tasks          chan CrawlRequest
-	responses      chan CrawlSession
-	stop           chan bool
+	responses      chan Page
+	cancel         func()
 }
 
-func NewWorkerController(us URLStore, ss SessionStore) (*WorkerController, error) {
-	dclient, err := docker.NewClient("unix:///var/run/docker.sock")
-	if err != nil {
-		return nil, err
+func NewWorkerController(ctx context.Context, conf WorkerControllerConfig) (*WorkerController, error) {
+	if conf.DockerClient == nil {
+		dclient, err := docker.NewClient("unix:///var/run/docker.sock")
+		if err != nil {
+			return nil, err
+		}
+		conf.DockerClient = dclient
 	}
 
+	_, cancel := context.WithCancel(ctx)
+
 	tasks := make(chan CrawlRequest)
-	responses := make(chan CrawlSession)
-	stop := make(chan bool)
+	responses := make(chan Page)
 	ready := make(chan bool, 1)
 
 	wc := &WorkerController{
+		ctx:       ctx,
+		conf:      conf,
 		tasks:     tasks,
 		responses: responses,
-		us:        us,
-		ss:        ss,
-		dclient:   dclient,
-		stop:      stop,
+		cancel:    cancel,
 		ready:     ready,
 	}
 
@@ -1220,9 +1245,9 @@ func NewWorkerController(us URLStore, ss SessionStore) (*WorkerController, error
 			select {
 			case sess := <-responses:
 				t := time.Now()
-				err := ss.SaveSession(sess)
-				us.Visit(sess.InitialURL, time.Now())
-				us.Add(sess.DocumentURLs...)
+				err := conf.PageStore.SaveSession(sess)
+				conf.URLStore.Visit(sess.InitialURL, time.Now())
+				conf.URLStore.Add(sess.DocumentURLs...)
 				wc.recentSessions = append(wc.recentSessions[1:len(wc.recentSessions)],
 					&SavedSession{
 						Session:       &sess,
@@ -1231,7 +1256,7 @@ func NewWorkerController(us URLStore, ss SessionStore) (*WorkerController, error
 						CrawlDuration: time.Since(sess.InitiatedTime),
 					})
 				ready <- true
-			case <-wc.stop:
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -1247,22 +1272,22 @@ func (wc *WorkerController) startQueue() {
 		var err error
 
 		select {
-		case <-wc.stop:
+		case <-wc.ctx.Done():
 			return
 		case <-wc.ready:
-			u, err = wc.us.Sample()
+			u, err = wc.conf.URLStore.Sample()
 			if err != nil {
 				select {
 				case <-time.After(500 * time.Millisecond):
 					continue
-				case <-wc.stop:
+				case <-wc.ctx.Done():
 					return
 				}
 			}
 		}
 
 		select {
-		case <-wc.stop:
+		case <-wc.ctx.Done():
 			return
 		case wc.tasks <- CrawlRequest{Url: u, Screenshots: []time.Duration{time.Second}}:
 		}
@@ -1276,7 +1301,7 @@ func (wc *WorkerController) AddWorker() error {
 	w, err := NewWorker(WorkerConfig{
 		Queue:        wc.tasks,
 		Responses:    wc.responses,
-		DockerClient: wc.dclient,
+		DockerClient: wc.conf.DockerClient,
 	})
 	if err != nil {
 		return err
@@ -1291,7 +1316,7 @@ func (wc *WorkerController) FactWidget() ui.Drawable {
 	fw := widgets.NewList()
 	update := func() {
 		fw.Rows = []string{
-			fmt.Sprintf("Known URLs: %d", wc.us.Size()),
+			fmt.Sprintf("Known URLs: %d", wc.conf.URLStore.Size()),
 		}
 	}
 
@@ -1331,7 +1356,7 @@ func (wc *WorkerController) FactRecentSessions() ui.Drawable {
 		ticker := time.NewTicker(2 * time.Second)
 		for {
 			select {
-			case <-wc.stop:
+			case <-wc.ctx.Done():
 				return
 			case <-ticker.C:
 				update()
@@ -1346,14 +1371,7 @@ func (wc *WorkerController) FactRecentSessions() ui.Drawable {
 }
 
 func (wc *WorkerController) Close() {
-	wc.m.Lock()
-	defer wc.m.Unlock()
-
-	wc.stop <- true
-
-	for _, w := range wc.workers {
-		w.Close()
-	}
+	wc.cancel()
 }
 
 func timeoutAction(f func() error, d time.Duration) error {

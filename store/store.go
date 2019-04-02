@@ -16,7 +16,7 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
-type sessStoreFunc func(*sql.Tx, *kraaler.CrawlSession) (interface{}, error)
+type sessStoreFunc func(*sql.Tx, *kraaler.Page) (interface{}, error)
 type actionStoreFunc func(*sql.Tx, *kraaler.CrawlAction) (interface{}, error)
 
 type Store struct {
@@ -65,7 +65,7 @@ func NewStore(db *sql.DB, bodyPath, screenPath string) (*Store, error) {
 	}, nil
 }
 
-func (s *Store) SaveSession(cs kraaler.CrawlSession) error {
+func (s *Store) SaveSession(cs kraaler.Page) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -122,7 +122,7 @@ func NewSessionStore(db *sql.DB) (*SessionStore, error) {
 	}, nil
 }
 
-func (ss *SessionStore) Save(tx *sql.Tx, sess *kraaler.CrawlSession) (int64, error) {
+func (ss *SessionStore) Save(tx *sql.Tx, sess *kraaler.Page) (int64, error) {
 	ins := WarehouseInserter{
 		"resolution_id": func(tx *sql.Tx) (interface{}, error) {
 			id, err := ss.dimResolution.Get(tx, sess.Resolution)
