@@ -133,13 +133,13 @@ func (ss *SessionStore) Save(tx *sql.Tx, sess *kraaler.Page) (int64, error) {
 			return id, nil
 		},
 		"navigated_time": func(tx *sql.Tx) (interface{}, error) {
-			return sess.NavigateTime.Unix(), nil
+			return sess.NavigateTime.UnixNano(), nil
 		},
 		"loaded_time": func(tx *sql.Tx) (interface{}, error) {
-			return sess.LoadedTime.Unix(), nil
+			return sess.LoadedTime.UnixNano(), nil
 		},
 		"terminated_time": func(tx *sql.Tx) (interface{}, error) {
-			return sess.TerminatedTime.Unix(), nil
+			return sess.TerminatedTime.UnixNano(), nil
 		},
 		"amount_of_actions": func(tx *sql.Tx) (interface{}, error) {
 			return len(sess.Actions), nil
@@ -222,7 +222,7 @@ func (ss *ScreenStore) Save(tx *sql.Tx, id int64, urlstr string, screenshots []*
 			return err
 		}
 
-		if _, err := sins.Insert(id, screen.Taken.Unix(), path); err != nil {
+		if _, err := sins.Insert(id, screen.Taken.UnixNano(), path); err != nil {
 			return err
 		}
 	}

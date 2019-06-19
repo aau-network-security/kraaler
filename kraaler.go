@@ -2,6 +2,7 @@ package kraaler
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -10,7 +11,10 @@ import (
 	"time"
 
 	"github.com/mafredri/cdp/protocol/network"
+	"go.uber.org/zap"
 )
+
+type CTXLOGGER struct{}
 
 type Domain string
 
@@ -61,33 +65,58 @@ func (r Resolution) String() string {
 	return fmt.Sprintf("%dx%d", r.Width, r.Height)
 }
 
-func ScanForServers(domains <-chan Domain) <-chan *url.URL {
+func ScanForServers(ctx context.Context, domains <-chan Domain) <-chan *url.URL {
 	out := make(chan *url.URL)
+	timeout := 5 * time.Second
+	log := func(string) {}
+
+	logger, ok := ctx.Value(CTXLOGGER{}).(*zap.SugaredLogger)
+	if ok {
+		log = func(addr string) {
+			logger.Info("found_web_server",
+				"addr", addr,
+			)
+		}
+	}
+
+	openport := func(d Domain, p int) bool {
+		endpoint := fmt.Sprintf("%s:%d", d, p)
+		conn, err := net.DialTimeout("tcp", endpoint, timeout)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+
+		return true
+	}
 
 	go func() {
 		defer close(out)
-
 		for d := range domains {
-			timeout := 5 * time.Second
-			openport := func(p int) bool {
-				endpoint := fmt.Sprintf("%s:%d", d, p)
-				conn, err := net.DialTimeout("tcp", endpoint, timeout)
-				if err != nil {
-					return false
+			if openport(d, 443) {
+				addr := d.HTTPS()
+				u, _ := url.Parse(addr)
+
+				select {
+				case <-ctx.Done():
+					return
+				case out <- u:
+					log(addr)
 				}
-				conn.Close()
 
-				return true
+				continue
 			}
 
-			if openport(80) {
-				u, _ := url.Parse(d.HTTP())
-				out <- u
-			}
+			if openport(d, 80) {
+				addr := d.HTTP()
+				u, _ := url.Parse(addr)
 
-			if openport(443) {
-				u, _ := url.Parse(d.HTTPS())
-				out <- u
+				select {
+				case <-ctx.Done():
+					return
+				case out <- u:
+					log(addr)
+				}
 			}
 		}
 	}()

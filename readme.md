@@ -1,16 +1,17 @@
 # Kraaler
 [![Build Status](https://travis-ci.com/aau-network-security/kraaler.svg?token=Yc2xb5VVELJexrKxtyY8&branch=master)](https://travis-ci.com/aau-network-security/kraaler)
 
-Web crawler built in Go, which utilize Chrome Debugging Protocol for gathering nested information about websites.
+This is an Go implementation of the design covered in the [Kraaler: A User Perspective Web Crawler]
 
-## Objectives
+## Running
 
-Crawl behaviour of web applications, such as:
+``` bash
+$ krl run -n 3 \ # amount of workers
+  --provider-file urls.txt \ # provider for urls
+  --sampler 'uni' \ # sampler for prioritization of urls
+  --filter-resp-bodies-ct '^text/' # only text bodies
+```
 
-- [ ] HTTP Requests, HTTP Responses (headers, status codes, methods, protocol versions)
-- [ ] Data of HTTP Responses
-- [ ] Output of JavaScript consoles
-- [ ] Do the above for every subsequent request conducted by the browser through parsing
 
-## Author
+## Contributors
 - Thomas Kobber Panum ([@tpanum](https://github.com/tpanum/))

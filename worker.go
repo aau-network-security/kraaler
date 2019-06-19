@@ -26,6 +26,7 @@ import (
 	"github.com/mafredri/cdp/session"
 	"github.com/patrickmn/go-cache"
 	"github.com/raff/godet"
+	"go.uber.org/zap"
 )
 
 const (
@@ -62,8 +63,9 @@ type Worker struct {
 	id        string
 	container *docker.Container
 	endpoint  string
-	kill      chan struct{}
+	killC     chan struct{}
 	hostInfo  *cache.Cache
+	logger    *zap.SugaredLogger
 
 	rpccConn       *rpcc.Conn
 	cdpClient      *cdp.Client
@@ -79,6 +81,7 @@ type WorkerConfig struct {
 	UseInstance  string
 	Resolution   *Resolution
 	LoadTimeout  *time.Duration
+	Logger       *zap.SugaredLogger
 }
 
 func NewWorker(conf WorkerConfig) (*Worker, error) {
@@ -106,8 +109,16 @@ func NewWorker(conf WorkerConfig) (*Worker, error) {
 	}
 
 	id := uuid.New().String()[0:8]
+
+	var logger *zap.SugaredLogger
+	if conf.Logger != nil {
+		logger = conf.Logger.With(zap.String("worker_id", id))
+	}
+
 	w := &Worker{
 		id:       id,
+		logger:   logger,
+		killC:    make(chan struct{}),
 		conf:     conf,
 		endpoint: conf.UseInstance,
 		hostInfo: cache.New(2*time.Minute, 30*time.Second),
@@ -121,12 +132,11 @@ func NewWorker(conf WorkerConfig) (*Worker, error) {
 		w.container = c
 	}
 
-	go w.listen(conf.Queue, conf.Responses)
-
 	return w, nil
 }
 
-func (w *Worker) listen(queue <-chan CrawlRequest, results chan<- Page) {
+func (w *Worker) Run() {
+	queue, results := w.conf.Queue, w.conf.Responses
 	errCheck := func(errs ...error) func(error) bool {
 		return func(err error) bool {
 			for _, e := range errs {
@@ -137,17 +147,21 @@ func (w *Worker) listen(queue <-chan CrawlRequest, results chan<- Page) {
 			return false
 		}
 	}
-	w.kill = make(chan struct{})
+
 	fetch := func(req CrawlRequest) Page {
-		resetErrs := errCheck(context.DeadlineExceeded, ErrDockerConn)
+		errForReset := errCheck(context.DeadlineExceeded, ErrDockerConn)
 
 		for {
-			timeout := 20 * time.Second
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			ctx := context.Background()
+			if w.conf.Logger != nil {
+				ctx = context.WithValue(ctx, CTXLOGGER{}, w.conf.Logger)
+			}
+			ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+
 			resp := w.fetch(ctx, req)
 			cancel()
 
-			if err := resp.Error; resetErrs(err) {
+			if err := resp.Error; errForReset(err) {
 				w.removeContainer(w.container)
 				var err error
 
@@ -163,19 +177,15 @@ func (w *Worker) listen(queue <-chan CrawlRequest, results chan<- Page) {
 		}
 	}
 
+	w.logger.Infow("worker_running")
+
 	for {
 		select {
-		case <-w.kill:
+		case <-w.killC:
 			return
 
 		case req := <-queue:
 			resp := fetch(req)
-			// if err := resp.Error; err != nil {
-			// 	if err != ErrTimeoutDOM && err != context.DeadlineExceeded && err != rpcc.ErrConnClosing && strings.HasPrefix(err.Error(), "net::") == false {
-			// 		fmt.Printf("error: %T %s\n", resp.Error, resp.Error)
-			// 		return
-			// 	}
-			// }
 			results <- resp
 
 		}
@@ -199,6 +209,7 @@ func (w *Worker) createContainer() (*docker.Container, error) {
 	w.endpoint = fmt.Sprintf("http://127.0.0.1:%d", port)
 
 	img := "chromedp/headless-shell"
+	var swap int64 = 0
 	opts := docker.CreateContainerOptions{
 		Name: fmt.Sprintf("kraaler-worker-%s", w.id),
 		Config: &docker.Config{
@@ -207,7 +218,7 @@ func (w *Worker) createContainer() (*docker.Container, error) {
 		},
 		HostConfig: &docker.HostConfig{
 			MemorySwap:       0,
-			MemorySwappiness: 0,
+			MemorySwappiness: swap,
 			Memory:           768 * 1024 * 1024,
 			CPUPeriod:        100000,
 			CPUQuota:         100000, // one core
@@ -482,12 +493,18 @@ func retrieveEvents(conn *godet.RemoteDebugger) (<-chan time.Time, map[string][]
 }
 
 func (w *Worker) fetch(ctx context.Context, req CrawlRequest) Page {
-	fmt.Printf("[%s] fetching %s\n", w.id, req.Url.String())
+	urlstr := req.Url.String()
+	w.logger.Infow("worker_fetch_start", "url", urlstr)
+	defer func() {
+		w.logger.Infow("worker_fetch_stop", "url", urlstr)
+	}()
+
 	result := Page{
 		InitialURL:    req.Url,
 		Resolution:    w.conf.Resolution.String(),
 		InitiatedTime: time.Now(),
 	}
+
 	replyErr := func(err error) Page {
 		if cdp.ErrorCause(err) == context.DeadlineExceeded {
 			if strings.HasPrefix(err.Error(), "cdp.Page:") {
@@ -496,15 +513,17 @@ func (w *Worker) fetch(ctx context.Context, req CrawlRequest) Page {
 			}
 
 			result.Error = context.DeadlineExceeded
-			return result
 		}
 
 		if strings.HasPrefix(err.Error(), "could not resolve") {
 			result.Error = ErrDockerConn
-			return result
 		}
 
-		result.Error = err
+		if result.Error == nil {
+			result.Error = err
+		}
+
+		w.logger.Infow("worker_fetch_error", "error", result.Error.Error())
 		return result
 	}
 
@@ -977,7 +996,7 @@ func (w *Worker) captureScreenshots(ctx context.Context, pg cdp.Page, durations 
 }
 
 func (w *Worker) Close() {
-	w.kill <- struct{}{}
+	close(w.killC)
 
 	if w.rpccConn != nil {
 		w.rpccConn.Close()
@@ -1092,10 +1111,10 @@ func PullImage(c *docker.Client, img string) error {
 
 func LinksFromBodies(host *url.URL, bodies ...*ResponseBody) []*url.URL {
 	var links []*url.URL
-	for _, b := range bodies {
-		l, _ := RetrieveLinks(host, b.Body)
-		links = append(links, l...)
-	}
+	// for _, b := range bodies {
+	// 	l, _ := RetrieveLinks(host, b.Body)
+	// 	links = append(links, l...)
+	// }
 
 	return links
 }
@@ -1119,18 +1138,20 @@ func WaitForEndpoint(ctx context.Context, endpoint string) error {
 		return nil
 	}
 
+loop:
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
+		case <-time.After(500 * time.Millisecond):
 			if err := connect(); err != nil {
 				for _, s := range []string{"connection reset", "connection refused"} {
 					if strings.Contains(err.Error(), s) {
-						time.Sleep(500 * time.Millisecond)
-						continue
+						continue loop
 					}
 				}
+
+				fmt.Println("wait err", err)
 
 				return err
 			}
@@ -1198,6 +1219,7 @@ type WorkerControllerConfig struct {
 	DockerClient   *docker.Client
 	URLStore       URLStore
 	PageStore      PageStore
+	Logger         *zap.SugaredLogger
 	PageMiddleware []PageMiddleware
 	URLMiddleware  []URLMiddleware
 }
@@ -1302,10 +1324,14 @@ func (wc *WorkerController) AddWorker() error {
 		Queue:        wc.tasks,
 		Responses:    wc.responses,
 		DockerClient: wc.conf.DockerClient,
+		Logger:       wc.conf.Logger,
 	})
 	if err != nil {
 		return err
 	}
+
+	go w.Run()
+
 	wc.workers = append(wc.workers, w)
 	wc.ready <- true
 

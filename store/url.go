@@ -107,7 +107,7 @@ func NewURLStore(db *sql.DB, opts ...URLStoreOpt) (*urlStore, error) {
 		us.urls[u] = nil
 
 		if unixTime.Valid && us.resampling {
-			t := time.Unix(unixTime.Int64, 0)
+			t := time.Unix(0, unixTime.Int64)
 			us.urls[u] = &t
 		}
 	}
@@ -135,12 +135,28 @@ func (us *urlStore) Sample() (*url.URL, error) {
 		return nil, fmt.Errorf("sample is nil")
 	}
 
+	if !us.resampling {
+		us.m.Lock()
+		delete(us.urls, u)
+		us.m.Unlock()
+	}
+
 	return u, nil
+}
+
+func (us *urlStore) Consume(p kraaler.URLProvider) {
+	go func() {
+		for u := range p.UrlsC() {
+			us.Add(u)
+		}
+	}()
 }
 
 func (us *urlStore) Add(urls ...*url.URL) (int, error) {
 	var urlsToAdd []*url.URL
-	us.m.RLock()
+	us.m.Lock()
+	defer us.m.Unlock()
+
 loop:
 	for _, u := range urls {
 		for _, f := range us.filters {
@@ -155,7 +171,6 @@ loop:
 
 		urlsToAdd = append(urlsToAdd, u)
 	}
-	us.m.RUnlock()
 
 	if len(urlsToAdd) == 0 {
 		return 0, nil
@@ -171,7 +186,6 @@ loop:
 		return 0, err
 	}
 
-	us.m.Lock()
 	var count int
 	var dbErr error
 
@@ -201,7 +215,6 @@ loop:
 		count += 1
 	}
 	tx.Commit()
-	us.m.Unlock()
 
 	return count, dbErr
 }
@@ -241,13 +254,13 @@ func (us *urlStore) FilterKnown(doms <-chan kraaler.Domain) <-chan kraaler.Domai
 	go func() {
 		for dom := range doms {
 			us.m.RLock()
-			if _, ok := us.strings[dom.HTTP()]; !ok {
+			if _, ok := us.strings[dom.HTTPS()]; !ok {
 				us.m.RUnlock()
 				out <- dom
 				continue
 			}
 
-			if _, ok := us.strings[dom.HTTPS()]; !ok {
+			if _, ok := us.strings[dom.HTTP()]; !ok {
 				us.m.RUnlock()
 				out <- dom
 				continue

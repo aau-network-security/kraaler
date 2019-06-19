@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aau-network-security/kraaler"
+	"go.uber.org/zap"
 )
 
 var (
@@ -64,16 +65,20 @@ func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool,
 	kraaler.WaitForEndpoint(context.Background(), endpoint)
 
 	second := time.Second
+	logger, _ := zap.NewDevelopment()
 	w, err := kraaler.NewWorker(kraaler.WorkerConfig{
 		Queue:       q,
 		Responses:   resps,
 		UseInstance: endpoint,
 		LoadTimeout: &second,
+		Logger:      logger.Sugar(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new worker error: %s", err)
 	}
 	defer w.Close()
+
+	go w.Run()
 
 	if ts.URL == "" {
 		ts.URL = "http://127.0.0.1:7272"
@@ -399,6 +404,7 @@ func TestCrawl(t *testing.T) {
 
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
+
 			port := getAvailablePort()
 			cmd := exec.Command(chromeBinary,
 				"--headless",
@@ -429,7 +435,7 @@ func TestCrawl(t *testing.T) {
 			if err := tc.validator(*resp); err != nil {
 				t.Fatal(err)
 			}
+
 		})
 	}
-
 }
