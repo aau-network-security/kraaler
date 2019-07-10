@@ -22,6 +22,14 @@ type URLProvider interface {
 	UrlsC() <-chan *url.URL
 }
 
+type URLChanProvider struct {
+	C <-chan *url.URL
+}
+
+func (ucp URLChanProvider) UrlsC() <-chan *url.URL {
+	return ucp.C
+}
+
 type DomainFileProvider struct {
 	path string
 	c    DomainFileProviderConfig

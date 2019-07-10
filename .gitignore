@@ -1,3 +1,5 @@
 app/*.txt
 app/main
 app/app
+app/krl
+app/crawled-data

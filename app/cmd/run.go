@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/aau-network-security/kraaler"
@@ -48,10 +50,12 @@ var runCmd = &cobra.Command{
 			log.Fatal(err)
 		}
 
-		logger, err := zap.NewProduction()
-		if err != nil {
-			stopWithErr(err)
-		}
+		ui := &runUI{}
+		var logOpts []zap.Option
+
+		logOpts = append(logOpts,
+			zap.WrapCore(ui.Wrapper),
+		)
 
 		smpl, ok := samplersByName[samplerName]
 		if !ok {
@@ -63,6 +67,24 @@ var runCmd = &cobra.Command{
 		if noResampling {
 			urlOpts = append(urlOpts, store.WithNoResampling())
 		}
+
+		screenshotDir := filepath.Join(dataDirectory, "screenshots")
+		bodiesDir := filepath.Join(dataDirectory, "response_bodies")
+		for _, dir := range []string{
+			dataDirectory,
+			screenshotDir,
+			bodiesDir,
+		} {
+			if err := ensureDir(dir); err != nil {
+				stopWithErr(err)
+			}
+		}
+
+		logger, err := newLogger(logOpts...)
+		if err != nil {
+			stopWithErr(err)
+		}
+		defer logger.Sync()
 
 		var providers []kraaler.URLProvider
 		for _, path := range providerDomainFiles {
@@ -78,18 +100,6 @@ var runCmd = &cobra.Command{
 
 		if len(providers) == 0 {
 			stopWithErr(fmt.Errorf("need one or more providers"))
-		}
-
-		screenshotDir := filepath.Join(dataDirectory, "screenshots")
-		bodiesDir := filepath.Join(dataDirectory, "response_bodies")
-		for _, dir := range []string{
-			dataDirectory,
-			screenshotDir,
-			bodiesDir,
-		} {
-			if err := ensureDir(dir); err != nil {
-				stopWithErr(err)
-			}
 		}
 
 		dbFile := filepath.Join(dataDirectory, "kraaler.db")
@@ -115,14 +125,13 @@ var runCmd = &cobra.Command{
 		wc, err := kraaler.NewWorkerController(context.Background(), kraaler.WorkerControllerConfig{
 			URLStore:  us,
 			PageStore: ps,
-			Logger:    logger.Sugar(),
+			Logger:    logger,
 		})
 		if err != nil {
 			stopWithErr(err)
 		}
-		defer wc.Close()
 
-		time.Sleep(10 * time.Second)
+		time.Sleep(5 * time.Second)
 
 		for i := 0; i < workerAmount; i++ {
 			err := wc.AddWorker()
@@ -131,15 +140,30 @@ var runCmd = &cobra.Command{
 			}
 		}
 
-		for {
-			time.Sleep(time.Minute)
-			if us.Size() == 0 {
-				fmt.Println("finished!")
-				return
-			}
+		if err := ui.Show(); err != nil {
+			fmt.Println("Unexpected error showing ui:", err)
 		}
 
+		sigs := make(chan os.Signal, 1)
+		done := make(chan struct{}, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+		go func() {
+			<-sigs
+			wc.Close()
+			done <- struct{}{}
+		}()
+
+		<-done
 	},
+}
+
+func newLogger(opts ...zap.Option) (*zap.Logger, error) {
+	cfg := zap.NewProductionConfig()
+	cfg.OutputPaths = []string{
+		"./crawled-data/log",
+	}
+	return cfg.Build(opts...)
 }
 
 func init() {

@@ -2,12 +2,16 @@ package kraaler_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -15,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aau-network-security/kraaler"
+	"github.com/aau-network-security/kraaler/store"
 	"go.uber.org/zap"
 )
 
@@ -67,18 +72,16 @@ func responseFromServerWithHandler(handler http.Handler, port uint, useTLS bool,
 	second := time.Second
 	logger, _ := zap.NewDevelopment()
 	w, err := kraaler.NewWorker(kraaler.WorkerConfig{
-		Queue:       q,
-		Responses:   resps,
 		UseInstance: endpoint,
 		LoadTimeout: &second,
-		Logger:      logger.Sugar(),
+		Logger:      logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new worker error: %s", err)
 	}
 	defer w.Close()
 
-	go w.Run()
+	go w.Run(q, resps)
 
 	if ts.URL == "" {
 		ts.URL = "http://127.0.0.1:7272"
@@ -437,5 +440,144 @@ func TestCrawl(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func randStr(len int) string {
+	bytes := make([]byte, len)
+	for i := 0; i < len; i++ {
+		bytes[i] = byte(65 + rand.Intn(25))
+	}
+	return string(bytes)
+}
+
+type testWorker struct {
+	m *http.ServeMux
+}
+
+func (*testWorker) Close() error {
+	return nil
+}
+
+func (tw *testWorker) Run(queue <-chan kraaler.CrawlRequest, results chan<- kraaler.Page) error {
+	fetch := func(r kraaler.CrawlRequest) kraaler.Page {
+		req := httptest.NewRequest("GET", r.Url.String(), nil)
+		w := httptest.NewRecorder()
+		tw.m.ServeHTTP(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			return kraaler.Page{Error: fmt.Errorf("Strang status code: %d", resp.StatusCode)}
+		}
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return kraaler.Page{Error: fmt.Errorf("Cannot read response body")}
+		}
+
+		if len(body) == 0 {
+			return kraaler.Page{Error: fmt.Errorf("No url in body")}
+		}
+
+		u, _ := url.Parse(string(body))
+		return kraaler.Page{DocumentURLs: []*url.URL{u}}
+	}
+
+	for r := range queue {
+		results <- fetch(r)
+	}
+
+	return nil
+}
+
+func TestWorkerController(t *testing.T) {
+	genServer := func(n int) (*http.ServeMux, <-chan bool) {
+		m := http.NewServeMux()
+		done := make(chan bool, 1)
+		getLink := func() string { return fmt.Sprintf("/%s", randStr(30)) }
+
+		lastLink := "/"
+		links := map[string]string{}
+		visits := map[string]struct{}{
+			lastLink: struct{}{},
+		}
+		for i := 0; i < n; i++ {
+			l := getLink()
+			links[lastLink] = l
+			lastLink = l
+			visits[lastLink] = struct{}{}
+		}
+		links[lastLink] = ""
+
+		m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			linkTo, ok := links[r.URL.Path]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+
+			if _, ok := visits[r.URL.Path]; ok {
+				delete(visits, r.URL.Path)
+				if len(visits) == 0 {
+					done <- true
+				}
+			}
+
+			fmt.Fprintf(w, "%s", linkTo)
+		})
+
+		return m, done
+	}
+
+	getDB := func(name string) (*sql.DB, string, error) {
+		tmpfile, err := ioutil.TempFile("", name)
+		if err != nil {
+			return nil, "", err
+		}
+		f := tmpfile.Name()
+		os.Remove(f)
+
+		db, err := sql.Open("sqlite3", f)
+		return db, f, err
+	}
+
+	serv, done := genServer(100)
+	prodWorker := func() (kraaler.Worker, error) {
+		return &testWorker{serv}, nil
+	}
+
+	db, fn, err := getDB("kraaler-url-store")
+	if err != nil {
+		t.Fatalf("unable to create db: %s", err)
+	}
+	defer os.RemoveAll(fn)
+
+	us, err := store.NewURLStore(db, store.WithNoResampling())
+	if err != nil {
+		t.Fatalf("unable to create url store: %s", err)
+	}
+
+	input := make(chan *url.URL, 1)
+	u, _ := url.Parse("/")
+	input <- u
+	close(input)
+
+	us.Consume(kraaler.URLChanProvider{input})
+
+	wc, err := kraaler.NewWorkerController(
+		context.Background(),
+		kraaler.WorkerControllerConfig{
+			URLStore:       us,
+			WorkerProducer: prodWorker,
+		},
+	)
+
+	wc.AddWorker()
+
+	select {
+	case <-done:
+		return
+	case <-time.After(5 * time.Second):
+		t.Fatalf("expected to have visited every endpoint")
 	}
 }
